@@ -790,11 +790,19 @@ class SLAMWithLoopClosure:
 def main(args=None):
     import sys
     
-    # Check for odometry-only mode
+    # Check for mode
+    USE_GROUND_TRUTH = False
     USE_CORRECTION = True
-    if len(sys.argv) > 1 and sys.argv[1] == '--odom-only':
-        USE_CORRECTION = False
-        print("\n*** RUNNING IN ODOMETRY-ONLY MODE (no corrections) ***\n")
+    
+    if len(sys.argv) > 1:
+        if sys.argv[1] == '--odom-only':
+            USE_CORRECTION = False
+            print("\n*** RUNNING IN ODOMETRY-ONLY MODE (no corrections) ***\n")
+        elif sys.argv[1] == '--ground-truth':
+            USE_GROUND_TRUTH = True
+            USE_CORRECTION = False
+            print("\n*** RUNNING WITH GROUND TRUTH POSE (from simulator) ***")
+            print("*** This shows what the map SHOULD look like with perfect localization ***\n")
     
     coppelia = robotica.Coppelia()
     robot = robotica.P3DX(coppelia.sim, 'PioneerP3DX', use_lidar=True)
@@ -811,10 +819,15 @@ def main(args=None):
         front_threshold=0.30
     )
     
-    slam = SLAMWithLoopClosure(initial_pose=(0, 0, 0), use_correction=USE_CORRECTION)
+    # Get initial ground truth pose
+    gt_x, gt_y, gt_theta = robot.get_ground_truth_pose()
+    initial_pose = (gt_x, gt_y, gt_theta) if USE_GROUND_TRUTH else (0, 0, 0)
     
-    # Track raw odometry trajectory for comparison
+    slam = SLAMWithLoopClosure(initial_pose=initial_pose, use_correction=USE_CORRECTION)
+    
+    # Track trajectories for comparison
     raw_odom_trajectory = []
+    ground_truth_trajectory = []
     
     # Visualization
     plt.ion()
@@ -848,16 +861,28 @@ def main(args=None):
     while coppelia.is_running():
         robot.update_odometry()
         odom_x, odom_y, odom_theta = robot.get_estimated_pose()
+        gt_x, gt_y, gt_theta = robot.get_ground_truth_pose()
         
-        # Track raw odometry
+        # Track trajectories
         raw_odom_trajectory.append((odom_x, odom_y))
+        ground_truth_trajectory.append((gt_x, gt_y))
         
         raw_lidar = robot.read_lidar_data()
         
-        # SLAM update with loop closure
-        corrected_x, corrected_y, corrected_theta = slam.update(
-            raw_lidar, odom_x, odom_y, odom_theta
-        )
+        # Use ground truth or odometry based on mode
+        if USE_GROUND_TRUTH:
+            # Directly use ground truth - no SLAM needed
+            corrected_x, corrected_y, corrected_theta = gt_x, gt_y, gt_theta
+            # Still update the map with ground truth pose
+            slam.mapper.update_map(raw_lidar, gt_x, gt_y, gt_theta)
+            # Create a pose node for trajectory tracking
+            node = PoseNode(len(slam.pose_graph), gt_x, gt_y, gt_theta, copy.deepcopy(raw_lidar))
+            slam.pose_graph.append(node)
+        else:
+            # SLAM update with corrections
+            corrected_x, corrected_y, corrected_theta = slam.update(
+                raw_lidar, odom_x, odom_y, odom_theta
+            )
         
         # Visualization
         if iteration % 10 == 0:
@@ -870,22 +895,25 @@ def main(args=None):
             ax1.plot(rx, ry, 'go', markersize=8, label='Current')
             ax1.legend()
             
-            # Update trajectory plot - show BOTH raw odom and corrected
+            # Update trajectory plot - show all trajectories
             traj_x, traj_y = slam.get_trajectory()
             raw_x = [p[0] for p in raw_odom_trajectory]
             raw_y = [p[1] for p in raw_odom_trajectory]
+            gt_traj_x = [p[0] for p in ground_truth_trajectory]
+            gt_traj_y = [p[1] for p in ground_truth_trajectory]
             
             ax2.clear()
+            ax2.plot(gt_traj_x, gt_traj_y, 'g-', linewidth=2, alpha=0.8, label='Ground Truth')
             ax2.plot(raw_x, raw_y, 'r-', linewidth=1, alpha=0.5, label='Raw Odometry')
             ax2.plot(traj_x, traj_y, 'b-', linewidth=1, alpha=0.7, label='SLAM Trajectory')
-            ax2.plot(corrected_x, corrected_y, 'go', markersize=8, label='Current')
-            ax2.plot(odom_x, odom_y, 'rx', markersize=8, label='Raw Odom Pos')
-            ax2.set_title(f"Trajectory (Loops: {slam.loop_closures_detected})")
+            ax2.plot(corrected_x, corrected_y, 'bo', markersize=8, label='Current SLAM')
+            ax2.plot(gt_x, gt_y, 'g*', markersize=10, label='Current GT')
+            ax2.set_title(f"Trajectory Comparison")
             ax2.set_xlabel("X (m)")
             ax2.set_ylabel("Y (m)")
             ax2.grid(True)
             ax2.axis('equal')
-            ax2.legend()
+            ax2.legend(loc='upper left', fontsize=8)
             
             fig.canvas.draw_idle()
             plt.pause(0.001)
@@ -897,10 +925,10 @@ def main(args=None):
         
         if iteration % 50 == 0:
             corr = slam.total_correction
-            # Show both raw odom and corrected positions
-            print(f"Iter {iteration:04d} | RawOdom: ({odom_x:.2f}, {odom_y:.2f}, {np.degrees(odom_theta):.1f}°) | "
-                  f"SLAM: ({corrected_x:.2f}, {corrected_y:.2f}, {np.degrees(corrected_theta):.1f}°) | "
-                  f"Corr: ({corr[0]:.2f}, {corr[1]:.2f}, {corr[2]:.1f}rad)")
+            # Show ground truth, raw odom, and SLAM positions
+            print(f"Iter {iteration:04d} | GT: ({gt_x:.2f}, {gt_y:.2f}, {np.degrees(gt_theta):.0f}°) | "
+                  f"Odom: ({odom_x:.2f}, {odom_y:.2f}, {np.degrees(odom_theta):.0f}°) | "
+                  f"SLAM: ({corrected_x:.2f}, {corrected_y:.2f}, {np.degrees(corrected_theta):.0f}°)")
         
         iteration += 1
         time.sleep(0.05)

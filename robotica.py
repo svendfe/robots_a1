@@ -114,6 +114,13 @@ class P3DX():
     def get_estimated_pose(self):
         return self.x, self.y, self.theta
     
+    def get_ground_truth_pose(self):
+        """Get the actual position from CoppeliaSim (for debugging/comparison)"""
+        position = self.sim.getObjectPosition(self.robot_base, self.sim.handle_world)
+        orientation = self.sim.getObjectOrientation(self.robot_base, self.sim.handle_world)
+        # orientation[2] is the rotation around Z axis (yaw)
+        return position[0], position[1], orientation[2]
+    
     def get_sonar(self):
         readings = []
         for i in range(self.num_sonar):
