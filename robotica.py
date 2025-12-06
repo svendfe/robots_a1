@@ -58,9 +58,14 @@ class P3DX():
     num_sonar = 16
     sonar_max = 1.0
 
+    WHEEL_RADIUS = 0.0975
+    WHEEL_BASE = 0.331
+
     def __init__(self, sim, robot_id, use_camera=False, use_lidar=False):
         self.sim = sim
-        print('*** getting handles', robot_id)
+        print(f'*** getting handles for /{robot_id}')
+
+        self.robot_base = self.sim.getObject(f'/{robot_id}') 
         self.left_motor = self.sim.getObject(f'/{robot_id}/leftMotor')
         self.right_motor = self.sim.getObject(f'/{robot_id}/rightMotor')
         self.sonar = []
@@ -69,8 +74,46 @@ class P3DX():
         if use_camera:
             self.camera = self.sim.getObject(f'/{robot_id}/camera')
         if use_lidar:
-            self.lidar = self.sim.getObject(f'/{robot_id}/lidar')
+            try:
+                self.lidar_handle = self.sim.getObject(f'/{robot_id}/lidar')
+            except:
+                print("No lidar obtained")
 
+            self.lidar_script = self.sim.getScript(self.sim.scripttype_childscript, self.lidar_handle)
+
+        self.dt = self.sim.getSimulationTimeStep()
+        # --- INTERNAL STATE (ODOMETRY) ---
+        # We start at 0,0,0 relative to where we turned on the robot
+        self.x = 0.0
+        self.y = 0.0
+        self.theta = 0.0
+
+    def update_odometry(self):
+        """
+        Calculates the new position based on wheel rotation.
+        Call this EVERY simulation step.
+        """
+        # 1. Get current velocity of wheels (Rad/s)
+        # We use getJointVelocity to see what the physics engine is actually doing
+        vl = self.sim.getJointVelocity(self.left_motor)
+        vr = self.sim.getJointVelocity(self.right_motor)
+        
+        # 2. Calculate Linear (v) and Angular (w) velocity of the robot
+        v = (self.WHEEL_RADIUS / 2) * (vr + vl)
+        w = (self.WHEEL_RADIUS / self.WHEEL_BASE) * (vr - vl)
+        
+        # 3. Update Position (Integration)
+        # New_Pos = Old_Pos + (Velocity * Time)
+        self.x += v * np.cos(self.theta) * self.dt
+        self.y += v * np.sin(self.theta) * self.dt
+        self.theta += w * self.dt
+        
+        # Normalize theta to -pi to +pi (optional but recommended)
+        self.theta = (self.theta + np.pi) % (2 * np.pi) - np.pi
+
+    def get_estimated_pose(self):
+        return self.x, self.y, self.theta
+    
     def get_sonar(self):
         readings = []
         for i in range(self.num_sonar):
@@ -84,12 +127,17 @@ class P3DX():
         img = cv2.flip(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), 0)
         return img
 
-    def get_lidar(self):
-        data = self.sim.getStringSignal('PioneerP3dxLidarData')
-        if data is None:
+    def read_lidar_data(self):
+        # We invoke the 'getLidarData' function inside the Lidar's specific script
+        try:
+            data = self.sim.callScriptFunction('getLidarData', self.lidar_script)
+            
+            if not data:
+                return []
+            return data 
+        except Exception as e:
+            # This handles cases where the script isn't initialized yet
             return []
-        else:
-            return self.sim.unpackFloatTable(data)
 
     def set_speed(self, left_speed, right_speed):
         self.sim.setJointTargetVelocity(self.left_motor, left_speed)
@@ -99,8 +147,6 @@ class P3DX():
         self.set_speed(velocity, velocity)
 
     def turn(self, turnVelocity):
-        # turnVelocity < 0 = turn left
-        # turnVelocity > 0 = turn right
         self.set_speed(+turnVelocity, -turnVelocity)
     
     def stop(self):
