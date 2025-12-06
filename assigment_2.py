@@ -11,22 +11,23 @@ import copy
 
 class ScanToMapLocalizer:
     """
-    Scan-to-map ICP localization.
-    
-    Matches each new scan against occupied cells in the map.
-    Does NOT rely on odometry at all - uses multi-hypothesis search.
+    Simple localizer that uses wheel velocities directly for dead reckoning,
+    with scan-to-map ICP refinement when map is available.
     """
     
-    def __init__(self):
+    def __init__(self, wheel_radius=0.0975, wheel_base=0.331):
         self.current_pose = [0.0, 0.0, 0.0]  # x, y, theta
         self.map_points = None
         self.map_update_counter = 0
-        self.last_scan_points = None
+        
+        # Robot parameters
+        self.wheel_radius = wheel_radius
+        self.wheel_base = wheel_base
         
         # ICP parameters
         self.max_iterations = 20
         self.convergence_threshold = 1e-4
-        self.max_correspondence_dist = 0.25
+        self.max_correspondence_dist = 0.3
         
     def extract_scan_points(self, lidar_local_points, min_range=0.15, max_range=4.0):
         """Extract valid 2D points from lidar scan."""
@@ -58,9 +59,8 @@ class ScanToMapLocalizer:
         
         points = np.column_stack([world_x, world_y])
         
-        # Subsample for speed
-        if len(points) > 800:
-            indices = np.random.choice(len(points), 800, replace=False)
+        if len(points) > 1000:
+            indices = np.random.choice(len(points), 1000, replace=False)
             points = points[indices]
         
         return points
@@ -78,30 +78,12 @@ class ScanToMapLocalizer:
         
         return np.column_stack([global_x, global_y])
     
-    def compute_scan_match_score(self, scan_local, map_points, pose):
-        """Compute how well a scan matches the map at given pose."""
-        if map_points is None or len(map_points) < 10:
-            return float('inf')
-        
-        scan_global = self.transform_to_global(scan_local, pose[0], pose[1], pose[2])
-        tree = KDTree(map_points)
-        distances, _ = tree.query(scan_global, k=1)
-        
-        # Use trimmed mean to be robust to outliers
-        distances = np.sort(distances)
-        n_use = int(len(distances) * 0.8)  # Use 80% closest
-        if n_use < 10:
-            return float('inf')
-        
-        return np.mean(distances[:n_use])
-    
-    def icp_refine(self, scan_local, map_points, initial_pose):
-        """Refine pose using ICP between scan and map."""
-        if map_points is None or len(map_points) < 20 or len(scan_local) < 20:
+    def icp_refine(self, scan_local, map_points, initial_pose, max_correction=0.1):
+        """Refine pose using ICP, with limited correction per step."""
+        if map_points is None or len(map_points) < 50 or len(scan_local) < 30:
             return initial_pose
         
         x, y, theta = initial_pose
-        prev_error = float('inf')
         tree = KDTree(map_points)
         
         for iteration in range(self.max_iterations):
@@ -109,16 +91,11 @@ class ScanToMapLocalizer:
             distances, indices = tree.query(scan_global, k=1)
             
             valid = distances < self.max_correspondence_dist
-            if np.sum(valid) < 15:
+            if np.sum(valid) < 20:
                 break
             
             scan_matched = scan_global[valid]
             map_matched = map_points[indices[valid]]
-            
-            mean_error = np.mean(distances[valid])
-            if iteration > 0 and abs(prev_error - mean_error) < self.convergence_threshold:
-                break
-            prev_error = mean_error
             
             scan_centroid = np.mean(scan_matched, axis=0)
             map_centroid = np.mean(map_matched, axis=0)
@@ -137,133 +114,70 @@ class ScanToMapLocalizer:
             t = map_centroid - R @ scan_centroid
             dtheta = np.arctan2(R[1, 0], R[0, 0])
             
-            # Apply correction with damping
-            alpha = 0.6
-            x += alpha * t[0]
-            y += alpha * t[1]
-            theta += alpha * dtheta
+            # Limit correction magnitude
+            t_mag = np.sqrt(t[0]**2 + t[1]**2)
+            if t_mag > max_correction:
+                t = t * (max_correction / t_mag)
+            dtheta = np.clip(dtheta, -0.1, 0.1)
             
-            # Normalize angle
-            while theta > np.pi:
-                theta -= 2 * np.pi
-            while theta < -np.pi:
-                theta += 2 * np.pi
+            x += t[0]
+            y += t[1]
+            theta += dtheta
+            
+            if t_mag < 0.001 and abs(dtheta) < 0.001:
+                break
+        
+        # Normalize angle
+        while theta > np.pi:
+            theta -= 2 * np.pi
+        while theta < -np.pi:
+            theta += 2 * np.pi
         
         return (x, y, theta)
     
-    def scan_to_scan_motion(self, current_scan, last_scan):
-        """Estimate motion between two scans using ICP."""
-        if last_scan is None or len(last_scan) < 30 or len(current_scan) < 30:
-            return 0.0, 0.0, 0.0
+    def update_from_velocity(self, v_left, v_right, dt):
+        """Update pose using wheel velocities (dead reckoning)."""
+        # Calculate linear and angular velocity
+        v = (self.wheel_radius / 2) * (v_right + v_left)
+        w = (self.wheel_radius / self.wheel_base) * (v_right - v_left)
         
-        # Build KD-tree for last scan (target)
-        tree = KDTree(last_scan)
+        # Update position
+        self.current_pose[0] += v * np.cos(self.current_pose[2]) * dt
+        self.current_pose[1] += v * np.sin(self.current_pose[2]) * dt
+        self.current_pose[2] += w * dt
         
-        dx, dy, dtheta = 0.0, 0.0, 0.0
-        current_transformed = current_scan.copy()
-        
-        for _ in range(15):
-            distances, indices = tree.query(current_transformed, k=1)
-            valid = distances < 0.5
-            if np.sum(valid) < 20:
-                break
-            
-            src = current_transformed[valid]
-            tgt = last_scan[indices[valid]]
-            
-            src_c = np.mean(src, axis=0)
-            tgt_c = np.mean(tgt, axis=0)
-            
-            H = (src - src_c).T @ (tgt - tgt_c)
-            U, _, Vt = np.linalg.svd(H)
-            R = Vt.T @ U.T
-            if np.linalg.det(R) < 0:
-                Vt[-1, :] *= -1
-                R = Vt.T @ U.T
-            
-            t = tgt_c - R @ src_c
-            ddtheta = np.arctan2(R[1, 0], R[0, 0])
-            
-            cos_t = np.cos(dtheta)
-            sin_t = np.sin(dtheta)
-            dx += cos_t * t[0] - sin_t * t[1]
-            dy += sin_t * t[0] + cos_t * t[1]
-            dtheta += ddtheta
-            
-            # Transform current scan
-            cos_d = np.cos(dtheta)
-            sin_d = np.sin(dtheta)
-            current_transformed = np.column_stack([
-                current_scan[:, 0] * cos_d - current_scan[:, 1] * sin_d + dx,
-                current_scan[:, 0] * sin_d + current_scan[:, 1] * cos_d + dy
-            ])
-        
-        # ICP gives us T such that T(current) ≈ last
-        # If current scan moved +dx to match last, walls moved +dx, so robot moved -dx
-        return -dx, -dy, -dtheta
+        # Normalize theta
+        while self.current_pose[2] > np.pi:
+            self.current_pose[2] -= 2 * np.pi
+        while self.current_pose[2] < -np.pi:
+            self.current_pose[2] += 2 * np.pi
     
     def update(self, lidar_local_points, occupancy_map, odom_x=0, odom_y=0, odom_theta=0):
-        """Update pose estimate using scan-to-scan + scan-to-map matching."""
+        """
+        Main update function. For now, just uses odometry pose directly
+        with ICP refinement against the map.
+        """
         scan_local = self.extract_scan_points(lidar_local_points)
         
         if len(scan_local) < 30:
             return tuple(self.current_pose)
         
-        # Step 1: Estimate motion from scan-to-scan ICP
-        motion_dx, motion_dy, motion_dtheta = self.scan_to_scan_motion(
-            scan_local, self.last_scan_points
-        )
-        
-        # Transform local motion to global
-        cos_t = np.cos(self.current_pose[2])
-        sin_t = np.sin(self.current_pose[2])
-        global_dx = cos_t * motion_dx - sin_t * motion_dy
-        global_dy = sin_t * motion_dx + cos_t * motion_dy
-        
-        # Initial guess from scan-to-scan motion
-        init_x = self.current_pose[0] + global_dx
-        init_y = self.current_pose[1] + global_dy
-        init_theta = self.current_pose[2] + motion_dtheta
-        
-        # Save current scan for next iteration
-        self.last_scan_points = scan_local
-        
         # Update map points cache
         self.map_update_counter += 1
-        if self.map_points is None or self.map_update_counter % 5 == 0:
+        if self.map_points is None or self.map_update_counter % 3 == 0:
             self.map_points = self.extract_map_points(occupancy_map)
         
-        # If not enough map yet, use scan-to-scan estimate
-        if self.map_points is None or len(self.map_points) < 100:
-            self.current_pose = [init_x, init_y, init_theta]
-            while self.current_pose[2] > np.pi:
-                self.current_pose[2] -= 2 * np.pi
-            while self.current_pose[2] < -np.pi:
-                self.current_pose[2] += 2 * np.pi
-            return tuple(self.current_pose)
-        
-        # Step 2: Refine with scan-to-map ICP
-        refined = self.icp_refine(scan_local, self.map_points, (init_x, init_y, init_theta))
-        
-        # Sanity check
-        dx = refined[0] - self.current_pose[0]
-        dy = refined[1] - self.current_pose[1]
-        jump = np.sqrt(dx**2 + dy**2)
-        
-        if jump > 0.3:  # Limit to 0.3m per frame
-            # Scale down the jump
-            scale = 0.3 / jump
-            self.current_pose[0] += dx * scale
-            self.current_pose[1] += dy * scale
-            self.current_pose[2] = refined[2]
-        else:
-            self.current_pose = list(refined)
-        
-        # Normalize angle
-        while self.current_pose[2] > np.pi:
-            self.current_pose[2] -= 2 * np.pi
-        while self.current_pose[2] < -np.pi:
-            self.current_pose[2] += 2 * np.pi
+        # If we have enough map, try to refine with ICP
+        if self.map_points is not None and len(self.map_points) > 100:
+            refined = self.icp_refine(scan_local, self.map_points, tuple(self.current_pose))
+            
+            # Only accept refinement if it's not too far from current pose
+            dx = refined[0] - self.current_pose[0]
+            dy = refined[1] - self.current_pose[1]
+            dist = np.sqrt(dx**2 + dy**2)
+            
+            if dist < 0.2:  # Accept small corrections
+                self.current_pose = list(refined)
         
         return tuple(self.current_pose)
     
@@ -272,7 +186,6 @@ class ScanToMapLocalizer:
     
     def set_pose(self, x, y, theta):
         self.current_pose = [x, y, theta]
-        self.last_scan_points = None
 
 
 class SimpleWallFollower:
@@ -710,7 +623,7 @@ class OccupancyMap:
 
 
 class SLAMWithLoopClosure:
-    """SLAM using scan-to-map matching for localization"""
+    """SLAM using dead reckoning + scan-to-map matching for localization"""
     
     def __init__(self, initial_pose=(0, 0, 0), use_correction=True):
         self.mapper = OccupancyMap(size_meters=20, resolution=0.1)
@@ -737,19 +650,22 @@ class SLAMWithLoopClosure:
         self.last_optimization_time = 0
         self.total_correction = [0.0, 0.0, 0.0]
         
-    def update(self, lidar_local_points, odom_x, odom_y, odom_theta):
-        """Update SLAM using scan-to-map matching for localization"""
+    def update_with_velocities(self, lidar_local_points, v_left, v_right, dt):
+        """Update SLAM using wheel velocities for dead reckoning + ICP refinement"""
         
         if self.use_scan_matching:
-            # Use scan-to-map ICP to estimate pose
-            # Pass the map so we can match against it
+            # First: update pose using wheel velocities (dead reckoning)
+            self.localizer.update_from_velocity(v_left, v_right, dt)
+            
+            # Then: refine with scan-to-map ICP
             est_x, est_y, est_theta = self.localizer.update(
-                lidar_local_points, self.mapper, odom_x, odom_y, odom_theta
+                lidar_local_points, self.mapper
             )
             self.current_pose = [est_x, est_y, est_theta]
         else:
-            # Use raw odometry (for comparison - will be bad)
-            self.current_pose = [odom_x, odom_y, odom_theta]
+            # Just use dead reckoning without ICP refinement
+            self.localizer.update_from_velocity(v_left, v_right, dt)
+            self.current_pose = list(self.localizer.current_pose)
         
         # Create new pose node
         node = PoseNode(
@@ -786,6 +702,10 @@ class SLAMWithLoopClosure:
                 print(f"   ✓ Map updated!\n")
                 
                 self.last_optimization_time = len(self.pose_graph)
+                
+                # Update localizer pose to match corrected trajectory
+                latest = self.pose_graph[-1]
+                self.localizer.set_pose(latest.x, latest.y, latest.theta)
         
         # Update current pose to latest node (possibly corrected)
         latest_node = self.pose_graph[-1]
@@ -795,6 +715,14 @@ class SLAMWithLoopClosure:
         if len(self.pose_graph) - self.last_optimization_time > 5:
             self.mapper.update_map(lidar_local_points, latest_node.x, latest_node.y, latest_node.theta)
         
+        return tuple(self.current_pose)
+    
+    def update(self, lidar_local_points, odom_x, odom_y, odom_theta):
+        """Legacy update method - kept for compatibility"""
+        # This just uses whatever pose the localizer has
+        if not self.use_scan_matching:
+            self.current_pose = [odom_x, odom_y, odom_theta]
+            self.localizer.set_pose(odom_x, odom_y, odom_theta)
         return tuple(self.current_pose)
     
     def get_trajectory(self):
@@ -870,23 +798,27 @@ def main(args=None):
     
     iteration = 0
     print("\n" + "="*70)
-    print("SLAM WITH SCAN-TO-MAP MATCHING")
+    print("SLAM WITH WHEEL VELOCITY DEAD RECKONING + ICP REFINEMENT")
     print("="*70)
     print("This system will:")
-    print("  ✓ Use scaled odometry as motion hint")
+    print("  ✓ Use wheel velocities for dead reckoning (not broken odometry)")
     print("  ✓ Refine pose with scan-to-map ICP matching")
     print("  ✓ Build occupancy grid map from lidar scans")
     print("  ✓ Detect loop closures and optimize trajectory")
     print("\nModes:")
-    print("  python assigment_2.py              - Scan-to-map SLAM")
+    print("  python assigment_2.py              - Dead reckoning + ICP SLAM")
     print("  python assigment_2.py --ground-truth - Use ground truth (debug)")
-    print("  python assigment_2.py --odom-only    - Use broken odometry (bad)")
+    print("  python assigment_2.py --odom-only    - Use dead reckoning only")
     print("="*70 + "\n")
     
     while coppelia.is_running():
         robot.update_odometry()
         odom_x, odom_y, odom_theta = robot.get_estimated_pose()
         gt_x, gt_y, gt_theta = robot.get_ground_truth_pose()
+        
+        # Get wheel velocities and time step for dead reckoning
+        v_left, v_right = robot.get_wheel_velocities()
+        dt = robot.get_time_step()
         
         # Record GT offset on first iteration (for comparison visualization)
         if gt_offset is None:
@@ -913,9 +845,9 @@ def main(args=None):
             node = PoseNode(len(slam.pose_graph), gt_rel_x, gt_rel_y, gt_rel_theta, copy.deepcopy(raw_lidar))
             slam.pose_graph.append(node)
         else:
-            # SLAM update with corrections
-            corrected_x, corrected_y, corrected_theta = slam.update(
-                raw_lidar, odom_x, odom_y, odom_theta
+            # SLAM update using wheel velocities for dead reckoning + ICP refinement
+            corrected_x, corrected_y, corrected_theta = slam.update_with_velocities(
+                raw_lidar, v_left, v_right, dt
             )
         
         # Visualization

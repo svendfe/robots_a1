@@ -121,6 +121,16 @@ class P3DX():
         # orientation[2] is the rotation around Z axis (yaw)
         return position[0], position[1], orientation[2]
     
+    def get_wheel_velocities(self):
+        """Get current wheel angular velocities (rad/s)"""
+        vl = self.sim.getJointVelocity(self.left_motor)
+        vr = self.sim.getJointVelocity(self.right_motor)
+        return vl, vr
+    
+    def get_time_step(self):
+        """Get simulation time step"""
+        return self.dt
+    
     def get_sonar(self):
         readings = []
         for i in range(self.num_sonar):
