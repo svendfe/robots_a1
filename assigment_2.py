@@ -128,23 +128,32 @@ class ScanMatchingLocalizer:
         """
         current_points = self.extract_points(lidar_local_points)
         
-        if len(current_points) < 20:
+        if len(current_points) < 30:
             return tuple(self.current_pose)
         
-        if self.last_scan_points is None or len(self.last_scan_points) < 20:
+        if self.last_scan_points is None or len(self.last_scan_points) < 30:
             self.last_scan_points = current_points
             return tuple(self.current_pose)
         
         # Use ICP to find motion from last scan to current scan
-        # We want to find transform T such that T(current) ≈ last
-        # This gives us the INVERSE of robot motion
-        dx, dy, dtheta, converged = self.icp(current_points, self.last_scan_points)
+        # When robot moves forward, walls appear to move backward in scan
+        # icp(last_scan, current_scan) gives us how walls moved (opposite of robot)
+        dx, dy, dtheta, converged = self.icp(self.last_scan_points, current_points)
         
-        # The robot moved in the opposite direction
-        # (if current scan moved +dx to match last, robot moved -dx)
+        # The transform tells us how WALLS moved, robot moved opposite
         robot_dx = -dx
-        robot_dy = -dy  
+        robot_dy = -dy
         robot_dtheta = -dtheta
+        
+        # Sanity check: reject unreasonable motions
+        # Robot can't move more than ~0.1m or rotate more than ~15° per frame
+        motion_magnitude = np.sqrt(robot_dx**2 + robot_dy**2)
+        
+        if motion_magnitude > 0.15 or abs(robot_dtheta) > 0.3:
+            # Motion seems too large - might be bad match
+            # Just keep previous pose, update scan
+            self.last_scan_points = current_points
+            return tuple(self.current_pose)
         
         # Transform local motion to global frame
         cos_t = np.cos(self.current_pose[2])
@@ -737,9 +746,10 @@ def main(args=None):
         front_threshold=0.30
     )
     
-    # Get initial ground truth pose
+    # Get initial ground truth pose - ALWAYS use it to start, otherwise we have no reference!
     gt_x, gt_y, gt_theta = robot.get_ground_truth_pose()
-    initial_pose = (gt_x, gt_y, gt_theta) if USE_GROUND_TRUTH else (0, 0, 0)
+    initial_pose = (gt_x, gt_y, gt_theta)  # Always start from ground truth position
+    print(f"\nInitial ground truth pose: ({gt_x:.2f}, {gt_y:.2f}, {np.degrees(gt_theta):.1f}°)")
     
     slam = SLAMWithLoopClosure(initial_pose=initial_pose, use_correction=USE_CORRECTION)
     
