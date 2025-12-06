@@ -11,20 +11,31 @@ import copy
 
 class ICPScanMatcher:
     """
-    Iterative Closest Point algorithm for scan matching.
-    Aligns current scan to previous scan to correct odometry drift.
+    Improved ICP with keyframe-based matching and better angular estimation.
+    Uses multiple reference frames to reduce drift accumulation.
     """
     
-    def __init__(self, max_iterations=50, tolerance=1e-5, max_correspondence_dist=0.5):
+    def __init__(self, max_iterations=50, tolerance=1e-6, max_correspondence_dist=0.3):
         self.max_iterations = max_iterations
         self.tolerance = tolerance
         self.max_correspondence_dist = max_correspondence_dist
+        
+        # Keyframe system - stable reference points
+        self.keyframes = []  # List of (points, global_x, global_y, global_theta)
+        self.keyframe_interval = 15  # Add keyframe every N frames
+        self.max_keyframes = 20  # Keep recent keyframes only
+        self.frame_count = 0
+        
+        # Local map built from recent scans
+        self.local_map_points = None
+        self.local_map_size = 5  # Number of scans to aggregate
+        self.recent_scans = deque(maxlen=self.local_map_size)
+        
+        # Last scan for frame-to-frame
         self.last_scan_points = None
         
-    def extract_points_from_scan(self, lidar_local_points, min_range=0.1, max_range=5.0):
-        """
-        Extract valid 2D points from lidar scan data.
-        """
+    def extract_points_from_scan(self, lidar_local_points, min_range=0.15, max_range=4.0):
+        """Extract valid 2D points from lidar scan data with stricter filtering."""
         if len(lidar_local_points) == 0:
             return np.array([]).reshape(0, 2)
         
@@ -40,29 +51,25 @@ class ICPScanMatcher:
         return points
     
     def transform_points(self, points, dx, dy, dtheta):
-        """
-        Apply a 2D rigid transformation to points.
-        """
+        """Apply a 2D rigid transformation to points."""
         if len(points) == 0:
             return points
         
         cos_t = np.cos(dtheta)
         sin_t = np.sin(dtheta)
         
-        # Rotation matrix
         R = np.array([[cos_t, -sin_t],
                       [sin_t, cos_t]])
         
-        # Apply rotation then translation
         rotated = points @ R.T
         transformed = rotated + np.array([dx, dy])
         
         return transformed
     
-    def find_correspondences(self, source_points, target_points):
+    def find_correspondences_robust(self, source_points, target_points, reject_ratio=0.2):
         """
-        Find nearest neighbors between source and target point clouds.
-        Returns matched pairs and distances.
+        Find correspondences with outlier rejection.
+        Rejects worst matches to improve robustness.
         """
         if len(source_points) == 0 or len(target_points) == 0:
             return np.array([]), np.array([]), np.array([])
@@ -77,26 +84,40 @@ class ICPScanMatcher:
         valid_target = target_points[indices[valid_mask]]
         valid_distances = distances[valid_mask]
         
+        # Reject worst matches (outliers)
+        if len(valid_distances) > 20:
+            threshold = np.percentile(valid_distances, (1 - reject_ratio) * 100)
+            inlier_mask = valid_distances < threshold
+            valid_source = valid_source[inlier_mask]
+            valid_target = valid_target[inlier_mask]
+            valid_distances = valid_distances[inlier_mask]
+        
         return valid_source, valid_target, valid_distances
     
-    def compute_transform(self, source_points, target_points):
+    def compute_transform_weighted(self, source_points, target_points, distances):
         """
-        Compute optimal rigid transformation (R, t) that aligns source to target.
-        Uses SVD-based least squares solution.
+        Compute transform with distance-based weighting.
+        Closer correspondences get more weight.
         """
-        if len(source_points) < 3 or len(target_points) < 3:
+        if len(source_points) < 5 or len(target_points) < 5:
             return 0.0, 0.0, 0.0
         
-        # Compute centroids
-        centroid_source = np.mean(source_points, axis=0)
-        centroid_target = np.mean(target_points, axis=0)
+        # Weight inversely proportional to distance
+        weights = 1.0 / (distances + 0.01)
+        weights = weights / np.sum(weights)
+        
+        # Weighted centroids
+        centroid_source = np.average(source_points, axis=0, weights=weights)
+        centroid_target = np.average(target_points, axis=0, weights=weights)
         
         # Center the points
         source_centered = source_points - centroid_source
         target_centered = target_points - centroid_target
         
-        # Compute cross-covariance matrix
-        H = source_centered.T @ target_centered
+        # Weighted cross-covariance matrix
+        H = np.zeros((2, 2))
+        for i in range(len(source_points)):
+            H += weights[i] * np.outer(source_centered[i], target_centered[i])
         
         # SVD
         U, S, Vt = np.linalg.svd(H)
@@ -112,47 +133,42 @@ class ICPScanMatcher:
         # Compute translation
         t = centroid_target - R @ centroid_source
         
-        # Extract angle from rotation matrix
         dtheta = np.arctan2(R[1, 0], R[0, 0])
         dx = t[0]
         dy = t[1]
         
         return dx, dy, dtheta
     
-    def icp(self, source_points, target_points, initial_guess=(0, 0, 0)):
+    def icp_robust(self, source_points, target_points, initial_guess=(0, 0, 0)):
         """
-        Run ICP algorithm to align source to target.
-        
-        Args:
-            source_points: Current scan points (Nx2)
-            target_points: Previous scan points (Nx2)  
-            initial_guess: Initial (dx, dy, dtheta) estimate from odometry
-            
-        Returns:
-            (dx, dy, dtheta): Refined transformation
-            converged: Whether ICP converged
-            error: Final mean squared error
+        Robust ICP with outlier rejection and weighted optimization.
         """
-        if len(source_points) < 10 or len(target_points) < 10:
+        if len(source_points) < 15 or len(target_points) < 15:
             return initial_guess, False, float('inf')
         
-        # Apply initial guess
         dx, dy, dtheta = initial_guess
         current_source = self.transform_points(source_points, dx, dy, dtheta)
         
         prev_error = float('inf')
+        best_result = (dx, dy, dtheta)
+        best_error = float('inf')
         
         for iteration in range(self.max_iterations):
-            # Find correspondences
-            matched_source, matched_target, distances = self.find_correspondences(
-                current_source, target_points
+            # Find correspondences with outlier rejection
+            matched_source, matched_target, distances = self.find_correspondences_robust(
+                current_source, target_points, reject_ratio=0.15
             )
             
             if len(matched_source) < 10:
-                return (dx, dy, dtheta), False, prev_error
+                return best_result, False, best_error
             
-            # Compute error
+            # Compute weighted error
             current_error = np.mean(distances**2)
+            
+            # Track best result
+            if current_error < best_error:
+                best_error = current_error
+                best_result = (dx, dy, dtheta)
             
             # Check convergence
             if abs(prev_error - current_error) < self.tolerance:
@@ -160,11 +176,16 @@ class ICPScanMatcher:
             
             prev_error = current_error
             
-            # Compute incremental transform
-            ddx, ddy, ddtheta = self.compute_transform(matched_source, matched_target)
+            # Compute weighted incremental transform
+            ddx, ddy, ddtheta = self.compute_transform_weighted(
+                matched_source, matched_target, distances
+            )
             
-            # Update cumulative transform
-            # Compose transformations properly
+            # Limit angular correction per iteration to avoid oscillation
+            max_angle_step = 0.05  # ~3 degrees
+            ddtheta = np.clip(ddtheta, -max_angle_step, max_angle_step)
+            
+            # Compose transformations
             cos_t = np.cos(dtheta)
             sin_t = np.sin(dtheta)
             
@@ -179,59 +200,164 @@ class ICPScanMatcher:
                 new_dtheta += 2 * np.pi
             
             dx, dy, dtheta = new_dx, new_dy, new_dtheta
-            
-            # Apply updated transform to original source
             current_source = self.transform_points(source_points, dx, dy, dtheta)
         
-        return (dx, dy, dtheta), False, prev_error
+        return best_result, False, best_error
     
-    def match_scan(self, current_scan, odom_delta):
+    def build_local_map(self, current_pose):
         """
-        Main interface: match current scan against previous scan.
+        Build a local map from recent keyframes for more stable matching.
+        """
+        if len(self.keyframes) == 0:
+            return None
+        
+        # Use keyframes near current position
+        current_x, current_y, current_theta = current_pose
+        
+        all_points = []
+        for kf_points, kf_x, kf_y, kf_theta in self.keyframes[-8:]:  # Last 8 keyframes
+            # Distance check
+            dist = np.sqrt((kf_x - current_x)**2 + (kf_y - current_y)**2)
+            if dist > 3.0:  # Skip keyframes too far away
+                continue
+            
+            # Transform keyframe points to current frame
+            # First to global, then to current local
+            cos_kf = np.cos(kf_theta)
+            sin_kf = np.sin(kf_theta)
+            
+            # To global
+            global_points = kf_points @ np.array([[cos_kf, sin_kf], [-sin_kf, cos_kf]])
+            global_points = global_points + np.array([kf_x, kf_y])
+            
+            # To current local frame
+            cos_cur = np.cos(-current_theta)
+            sin_cur = np.sin(-current_theta)
+            
+            local_points = global_points - np.array([current_x, current_y])
+            local_points = local_points @ np.array([[cos_cur, sin_cur], [-sin_cur, cos_cur]])
+            
+            all_points.append(local_points)
+        
+        if len(all_points) == 0:
+            return None
+        
+        return np.vstack(all_points)
+    
+    def match_scan(self, current_scan, odom_delta, current_global_pose):
+        """
+        Match current scan using both frame-to-frame and keyframe matching.
         
         Args:
             current_scan: Current lidar points (local frame)
             odom_delta: (dx, dy, dtheta) from odometry since last scan
+            current_global_pose: Current estimated (x, y, theta) for keyframe building
             
         Returns:
             corrected_delta: Refined (dx, dy, dtheta)
             correction: How much ICP corrected the odometry
         """
+        self.frame_count += 1
         current_points = self.extract_points_from_scan(current_scan)
         
-        if self.last_scan_points is None or len(self.last_scan_points) < 10:
-            self.last_scan_points = current_points
+        if len(current_points) < 15:
             return odom_delta, (0, 0, 0)
         
-        # Run ICP to refine odometry estimate
-        refined_delta, converged, error = self.icp(
-            current_points, 
+        # Initialize on first scan
+        if self.last_scan_points is None or len(self.last_scan_points) < 15:
+            self.last_scan_points = current_points
+            # Add first keyframe
+            self.keyframes.append((
+                current_points.copy(),
+                current_global_pose[0],
+                current_global_pose[1],
+                current_global_pose[2]
+            ))
+            return odom_delta, (0, 0, 0)
+        
+        # === Method 1: Frame-to-frame ICP ===
+        refined_f2f, converged_f2f, error_f2f = self.icp_robust(
+            current_points,
             self.last_scan_points,
             initial_guess=odom_delta
         )
         
-        # Calculate correction
-        correction = (
-            refined_delta[0] - odom_delta[0],
-            refined_delta[1] - odom_delta[1],
-            refined_delta[2] - odom_delta[2]
+        # === Method 2: Frame-to-local-map ICP (more stable) ===
+        local_map = self.build_local_map(current_global_pose)
+        
+        if local_map is not None and len(local_map) > 50:
+            # For map matching, initial guess is near-zero (already in local frame)
+            refined_f2m, converged_f2m, error_f2m = self.icp_robust(
+                current_points,
+                local_map,
+                initial_guess=(0, 0, 0)  # Small correction expected
+            )
+            
+            # Combine f2m correction with odometry delta
+            refined_f2m = (
+                odom_delta[0] + refined_f2m[0],
+                odom_delta[1] + refined_f2m[1],
+                odom_delta[2] + refined_f2m[2]
+            )
+        else:
+            refined_f2m = refined_f2f
+            error_f2m = float('inf')
+            converged_f2m = False
+        
+        # === Fuse results ===
+        # Weight by inverse error (lower error = more trust)
+        if error_f2f < 0.001:
+            error_f2f = 0.001
+        if error_f2m < 0.001:
+            error_f2m = 0.001
+        
+        w_f2f = 1.0 / error_f2f if converged_f2f else 0.3 / error_f2f
+        w_f2m = 1.0 / error_f2m if converged_f2m else 0.3 / error_f2m
+        
+        # Normalize weights
+        total_w = w_f2f + w_f2m
+        w_f2f /= total_w
+        w_f2m /= total_w
+        
+        # Weighted average
+        refined_delta = (
+            w_f2f * refined_f2f[0] + w_f2m * refined_f2m[0],
+            w_f2f * refined_f2f[1] + w_f2m * refined_f2m[1],
+            w_f2f * refined_f2f[2] + w_f2m * refined_f2m[2]
         )
         
-        # Update last scan for next iteration
+        # Sanity check: don't allow huge corrections
+        max_trans_correction = 0.1  # 10cm max
+        max_rot_correction = 0.15   # ~8.5 degrees max
+        
+        correction = (
+            np.clip(refined_delta[0] - odom_delta[0], -max_trans_correction, max_trans_correction),
+            np.clip(refined_delta[1] - odom_delta[1], -max_trans_correction, max_trans_correction),
+            np.clip(refined_delta[2] - odom_delta[2], -max_rot_correction, max_rot_correction)
+        )
+        
+        final_delta = (
+            odom_delta[0] + correction[0],
+            odom_delta[1] + correction[1],
+            odom_delta[2] + correction[2]
+        )
+        
+        # Update last scan
         self.last_scan_points = current_points
         
-        # If ICP didn't converge well, trust odometry more
-        if not converged or error > 0.1:
-            # Blend between odometry and ICP (trust odometry 70%, ICP 30%)
-            alpha = 0.3
-            blended_delta = (
-                odom_delta[0] + alpha * correction[0],
-                odom_delta[1] + alpha * correction[1],
-                odom_delta[2] + alpha * correction[2]
-            )
-            return blended_delta, correction
+        # Add keyframe periodically
+        if self.frame_count % self.keyframe_interval == 0:
+            self.keyframes.append((
+                current_points.copy(),
+                current_global_pose[0],
+                current_global_pose[1], 
+                current_global_pose[2]
+            ))
+            # Keep only recent keyframes
+            if len(self.keyframes) > self.max_keyframes:
+                self.keyframes.pop(0)
         
-        return refined_delta, correction
+        return final_delta, correction
 
 
 class SimpleWallFollower:
@@ -722,8 +848,9 @@ class SLAMWithLoopClosure:
             odom_delta = (dx_local, dy_local, dtheta)
         
         # Use ICP to refine the motion estimate
+        # Pass current pose estimate for keyframe-based matching
         corrected_delta, icp_correction = self.scan_matcher.match_scan(
-            lidar_local_points, odom_delta
+            lidar_local_points, odom_delta, tuple(self.current_pose)
         )
         
         # Track cumulative correction for statistics
