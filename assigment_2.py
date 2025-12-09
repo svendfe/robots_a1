@@ -118,7 +118,7 @@ class PoseGraphOptimizer:
     """Simple pose graph optimization for loop closure"""
     
     def __init__(self):
-        self.optimization_strength = 0.5
+        self.optimization_strength = 0.1
     
     def optimize_trajectory(self, pose_graph, loop_closure_from, loop_closure_to):
         """
@@ -434,8 +434,8 @@ class SLAMWithLoopClosure:
     def __init__(self, initial_pose=(0, 0, 0), use_loop_closure=True):
         self.mapper = OccupancyMap(size_meters=20, resolution=0.1)
         self.loop_detector = LoopClosureDetector(
-            distance_threshold=0.8,
-            scan_similarity_threshold=0.80,
+            distance_threshold=0.2,
+            scan_similarity_threshold=0.90,
             min_time_gap=80
         )
         self.optimizer = PoseGraphOptimizer()
