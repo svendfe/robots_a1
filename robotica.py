@@ -31,14 +31,25 @@ class Coppelia():
 
     def __init__(self):
         print('*** connecting to coppeliasim')
-        client = RemoteAPIClient()
-        self.sim = client.getObject('sim')
+        self.client = RemoteAPIClient()
+        self.sim = self.client.getObject('sim')
 
-    def start_simulation(self):
+    def start_simulation(self, stepping=False):
         # print('*** saving environment')
         self.default_idle_fps = self.sim.getInt32Param(self.sim.intparam_idle_fps)
         self.sim.setInt32Param(self.sim.intparam_idle_fps, 0)
+        
+        self.stepping = stepping
+        if stepping:
+            # Enable stepping mode - simulation only advances when we call step()
+            self.client.setStepping(True)
+        
         self.sim.startSimulation()
+    
+    def step(self):
+        """Advance simulation by one step (only works in stepping mode)"""
+        if self.stepping:
+            self.client.step()
 
     def stop_simulation(self):
         # print('*** stopping simulation')
@@ -92,7 +103,9 @@ class P3DX():
         self.theta = 0.0
         
         # --- ENCODER STATE ---
-        # Store the last encoder readings (joint positions in radians)
+        # Track accumulated wheel rotations (in radians, not wrapped)
+        self.accumulated_left = 0.0
+        self.accumulated_right = 0.0
         self.last_left_encoder = self.sim.getJointPosition(self.left_motor)
         self.last_right_encoder = self.sim.getJointPosition(self.right_motor)
 
@@ -107,38 +120,35 @@ class P3DX():
     def update_odometry(self):
         """
         Calculates the new position based on wheel encoder changes.
-        This is more accurate than velocity integration as it measures
-        actual wheel rotation, not commanded velocity.
+        Uses velocity-based integration with fixed timestep for stepping mode.
         """
-        # 1. Read current encoder positions (joint angles in radians)
-        current_left = self.sim.getJointPosition(self.left_motor)
-        current_right = self.sim.getJointPosition(self.right_motor)
+        # Use the fixed simulation timestep (more reliable in stepping mode)
+        dt = self.dt
         
-        # 2. Calculate the change in encoder values (handle wrap-around)
-        delta_left = self._normalize_angle_delta(current_left - self.last_left_encoder)
-        delta_right = self._normalize_angle_delta(current_right - self.last_right_encoder)
+        # Use joint velocity (rad/s) - this doesn't have wrap-around issues
+        vl = self.sim.getJointVelocity(self.left_motor)
+        vr = self.sim.getJointVelocity(self.right_motor)
         
-        # 3. Update last encoder readings
-        self.last_left_encoder = current_left
-        self.last_right_encoder = current_right
+        # Calculate angular displacement of each wheel
+        delta_left = vl * dt
+        delta_right = vr * dt
         
-        # 4. Convert encoder deltas to wheel travel distance
+        # Convert to wheel travel distance
         dist_left = delta_left * self.WHEEL_RADIUS
         dist_right = delta_right * self.WHEEL_RADIUS
         
-        # 5. Calculate robot displacement using differential drive kinematics
+        # Calculate robot displacement using differential drive kinematics
         dist_center = (dist_left + dist_right) / 2.0
         delta_theta = (dist_right - dist_left) / self.WHEEL_BASE
         
-        # 6. Update pose using the midpoint integration method
-        # This is more accurate than simple Euler integration
+        # Update pose using the midpoint integration method
         mid_theta = self.theta + delta_theta / 2.0
         
         self.x += dist_center * np.cos(mid_theta)
         self.y += dist_center * np.sin(mid_theta)
         self.theta += delta_theta
 
-        # 7. Normalize theta to [-pi, pi]
+        # Normalize theta to [-pi, pi]
         self.theta = (self.theta + np.pi) % (2 * np.pi) - np.pi
 
     def get_estimated_pose(self):

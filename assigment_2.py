@@ -540,7 +540,7 @@ def main(args=None):
     
     coppelia = robotica.Coppelia()
     robot = robotica.P3DX(coppelia.sim, 'PioneerP3DX', use_lidar=True)
-    coppelia.start_simulation()
+    coppelia.start_simulation(stepping=True)  # Enable stepping mode for synchronized simulation
     
     wf = SimpleWallFollower(
         base_speed=0.6,
@@ -686,12 +686,15 @@ def main(args=None):
         left_speed, right_speed = wf.step(dist)
         robot.set_speed(left_speed, right_speed)
         
+        # Step the simulation forward (synchronized mode)
+        coppelia.step()
+        
         if iteration % 50 == 0:
             print(f"Iter {iteration:04d} | GT: ({gt_x:.2f}, {gt_y:.2f}, {np.degrees(gt_theta):.0f}°) | "
                   f"Odom: ({corrected_x:.2f}, {corrected_y:.2f}, {np.degrees(corrected_theta):.0f}°)")
         
         iteration += 1
-        time.sleep(0.05)
+        # No sleep needed - stepping mode synchronizes simulation with Python
     
     coppelia.stop_simulation()
     
