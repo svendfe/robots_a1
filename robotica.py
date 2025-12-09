@@ -58,8 +58,9 @@ class P3DX():
     num_sonar = 16
     sonar_max = 1.0
 
-    WHEEL_RADIUS = 0.0975
-    WHEEL_BASE = 0.381
+    # Physical parameters (use actual values)
+    WHEEL_RADIUS = 0.0975  # 195mm diameter / 2
+    WHEEL_BASE = 0.381     # Axle track
 
     def __init__(self, sim, robot_id, use_camera=False, use_lidar=False):
         self.sim = sim
@@ -83,46 +84,61 @@ class P3DX():
 
         self.dt = self.sim.getSimulationTimeStep()
         self.last_sim_time = self.sim.getSimulationTime()
+        
         # --- INTERNAL STATE (ODOMETRY) ---
         # We start at 0,0,0 relative to where we turned on the robot
         self.x = 0.0
         self.y = 0.0
         self.theta = 0.0
+        
+        # --- ENCODER STATE ---
+        # Store the last encoder readings (joint positions in radians)
+        self.last_left_encoder = self.sim.getJointPosition(self.left_motor)
+        self.last_right_encoder = self.sim.getJointPosition(self.right_motor)
+
+    def _normalize_angle_delta(self, delta):
+        """Normalize angle delta to [-pi, pi] to handle encoder wrap-around"""
+        while delta > np.pi:
+            delta -= 2 * np.pi
+        while delta < -np.pi:
+            delta += 2 * np.pi
+        return delta
 
     def update_odometry(self):
         """
-        Calculates the new position based on wheel rotation.
-        Call this EVERY simulation step.
+        Calculates the new position based on wheel encoder changes.
+        This is more accurate than velocity integration as it measures
+        actual wheel rotation, not commanded velocity.
         """
-        # Calculate time delta since last update
-        current_time = self.sim.getSimulationTime()
-        dt = current_time - self.last_sim_time
-        self.last_sim_time = current_time
+        # 1. Read current encoder positions (joint angles in radians)
+        current_left = self.sim.getJointPosition(self.left_motor)
+        current_right = self.sim.getJointPosition(self.right_motor)
         
-        if dt <= 0:
-            return
+        # 2. Calculate the change in encoder values (handle wrap-around)
+        delta_left = self._normalize_angle_delta(current_left - self.last_left_encoder)
+        delta_right = self._normalize_angle_delta(current_right - self.last_right_encoder)
+        
+        # 3. Update last encoder readings
+        self.last_left_encoder = current_left
+        self.last_right_encoder = current_right
+        
+        # 4. Convert encoder deltas to wheel travel distance
+        dist_left = delta_left * self.WHEEL_RADIUS
+        dist_right = delta_right * self.WHEEL_RADIUS
+        
+        # 5. Calculate robot displacement using differential drive kinematics
+        dist_center = (dist_left + dist_right) / 2.0
+        delta_theta = (dist_right - dist_left) / self.WHEEL_BASE
+        
+        # 6. Update pose using the midpoint integration method
+        # This is more accurate than simple Euler integration
+        mid_theta = self.theta + delta_theta / 2.0
+        
+        self.x += dist_center * np.cos(mid_theta)
+        self.y += dist_center * np.sin(mid_theta)
+        self.theta += delta_theta
 
-        # 1. Get current velocity of wheels (Rad/s)
-        # We use getJointVelocity to see what the physics engine is actually doing
-        vl = self.sim.getJointVelocity(self.left_motor)
-        vr = self.sim.getJointVelocity(self.right_motor)
-        
-        # 2. Calculate Linear (v) and Angular (w) velocity of the robot
-        v = (self.WHEEL_RADIUS / 2) * (vr + vl)
-        w = (self.WHEEL_RADIUS / self.WHEEL_BASE) * (vr - vl)
-        
-        # 3. Update Position (Integration)
-        # 4. Update Position (Exact Arc Integration)
-        if abs(w) < 1e-6: # Moving straight (avoid division by zero)
-            self.x += v * np.cos(self.theta) * dt
-            self.y += v * np.sin(self.theta) * dt
-            self.theta += w * dt
-        else: # Moving in an arc
-            self.x += (v / w) * (np.sin(self.theta + w * dt) - np.sin(self.theta))
-            self.y -= (v / w) * (np.cos(self.theta + w * dt) - np.cos(self.theta))
-            self.theta += w * dt
-
-        # Normalize theta
+        # 7. Normalize theta to [-pi, pi]
         self.theta = (self.theta + np.pi) % (2 * np.pi) - np.pi
 
     def get_estimated_pose(self):
