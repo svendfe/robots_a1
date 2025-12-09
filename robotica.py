@@ -58,8 +58,8 @@ class P3DX():
     num_sonar = 16
     sonar_max = 1.0
 
-    WHEEL_RADIUS = 0.0975
-    WHEEL_BASE = 0.331
+    WHEEL_RADIUS = 0.095
+    WHEEL_BASE = 0.381
 
     def __init__(self, sim, robot_id, use_camera=False, use_lidar=False):
         self.sim = sim
@@ -103,12 +103,17 @@ class P3DX():
         w = (self.WHEEL_RADIUS / self.WHEEL_BASE) * (vr - vl)
         
         # 3. Update Position (Integration)
-        # New_Pos = Old_Pos + (Velocity * Time)
-        self.x += v * np.cos(self.theta) * self.dt
-        self.y += v * np.sin(self.theta) * self.dt
-        self.theta += w * self.dt
-        
-        # Normalize theta to -pi to +pi (optional but recommended)
+        # 4. Update Position (Exact Arc Integration)
+        if abs(w) < 1e-6: # Moving straight (avoid division by zero)
+            self.x += v * np.cos(self.theta) * self.dt
+            self.y += v * np.sin(self.theta) * self.dt
+            self.theta += w * self.dt
+        else: # Moving in an arc
+            self.x += (v / w) * (np.sin(self.theta + w * self.dt) - np.sin(self.theta))
+            self.y -= (v / w) * (np.cos(self.theta + w * self.dt) - np.cos(self.theta))
+            self.theta += w * self.dt
+
+        # Normalize theta
         self.theta = (self.theta + np.pi) % (2 * np.pi) - np.pi
 
     def get_estimated_pose(self):
