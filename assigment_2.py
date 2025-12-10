@@ -27,7 +27,7 @@ class ScanMatcher:
     
     def preprocess_scan(self, scan_points, max_range=4.0, min_range=0.1, downsample_factor=2):
         if len(scan_points) == 0: return np.array([]).reshape(0, 2)
-        data = np.array(scan_points).reshape(-1, 3)
+        data = np.asarray(scan_points).reshape(-1, 3)
         x, y = data[:, 0], data[:, 1]
         distances = np.sqrt(x**2 + y**2)
         valid = (distances > min_range) & (distances < max_range)
@@ -147,7 +147,7 @@ class LoopClosureDetector:
     
     def compute_scan_signature(self, scan_points):
         if len(scan_points) == 0: return None
-        data = np.array(scan_points).reshape(-1, 3)
+        data = np.asarray(scan_points).reshape(-1, 3)
         x, y = data[:, 0], data[:, 1]
         angles = np.arctan2(y, x)
         distances = np.sqrt(x**2 + y**2)
@@ -247,7 +247,7 @@ class OccupancyMap:
     
     def update_map(self, lidar_local_points, robot_x, robot_y, robot_theta):
         if len(lidar_local_points) == 0: return
-        data = np.array(lidar_local_points).reshape(-1, 3)
+        data = np.asarray(lidar_local_points).reshape(-1, 3)
         local_x, local_y = data[:, 0], data[:, 1]
         distances = np.sqrt(local_x**2 + local_y**2)
         valid = distances < self.max_lidar_range
@@ -257,10 +257,32 @@ class OccupancyMap:
         global_y = (local_x * np.sin(robot_theta) + local_y * np.cos(robot_theta)) + robot_y
         gx, gy = self.world_to_grid(global_x, global_y)
         rx, ry = self.world_to_grid(robot_x, robot_y)
+        
+        # Use sets to avoid updating the same cell multiple times per scan
+        free_cells = set()
+        occupied_cells = set()
+        
         for x, y in zip(gx, gy):
             rr, cc = line(int(rx), int(ry), x, y)
-            if len(cc) > 1: self.log_odds[cc[:-1], rr[:-1]] += self.log_free
-            if len(cc) > 0: self.log_odds[cc[-1], rr[-1]] += self.log_occ
+            if len(cc) > 0:
+                # The last point is the obstacle
+                occupied_cells.add((cc[-1], rr[-1]))
+                # All previous points are free space
+                for i in range(len(cc) - 1):
+                    free_cells.add((cc[i], rr[i]))
+        
+        # Ensure a cell is not marked both free and occupied (obstacle takes precedence)
+        free_cells -= occupied_cells
+        
+        # Bulk update numpy array
+        if free_cells:
+            fc, fr = zip(*free_cells)
+            self.log_odds[fc, fr] += self.log_free
+        
+        if occupied_cells:
+            oc, orow = zip(*occupied_cells)
+            self.log_odds[oc, orow] += self.log_occ
+            
         self.log_odds = np.clip(self.log_odds, self.log_min, self.log_max)
     
     def rebuild_from_trajectory(self, pose_graph):
@@ -403,7 +425,7 @@ class SLAMWithScanMatching:
     def analyze_environment(self, points):
         """Returns True if environment is a Corridor (high aspect ratio)"""
         if len(points) < 10: return False
-        data = np.array(points).reshape(-1, 3) 
+        data = np.asarray(points).reshape(-1, 3) 
         xy = data[:, 0:2]
         if xy.shape[0] < 5: return False
         cov = np.cov(xy.T)

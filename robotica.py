@@ -142,10 +142,11 @@ class P3DX():
     def read_lidar_data(self):
         try:
             data = self.sim.callScriptFunction('getLidarData', self.lidar_script)
-            if not data: return []
-            return data 
+            if not data: return np.array([]).reshape(0, 3)
+            # Return as (N, 3) numpy array for efficient downstream processing
+            return np.array(data).reshape(-1, 3)
         except:
-            return []
+            return np.array([]).reshape(0, 3)
 
     def set_speed(self, left_speed, right_speed):
         self.sim.setJointTargetVelocity(self.left_motor, left_speed)
