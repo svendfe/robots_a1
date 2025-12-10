@@ -46,14 +46,13 @@ class ScanMatcher:
     Aligns two lidar scans by iteratively finding correspondences and 
     estimating the transformation. This is the core of scan-to-scan matching.
     
-    I spent way too long tuning these parameters... the defaults work ok for indoor.
     """
     def __init__(self, max_iterations=20, tolerance=1e-4, 
                  max_correspondence_dist=0.3, min_points=10):
         self.max_iterations = max_iterations
-        self.tolerance = tolerance  # stop when change is smaller than this
+        self.tolerance = tolerance                              # stop when change is smaller than this
         self.max_correspondence_dist = max_correspondence_dist  # reject matches farther than this
-        self.min_points = min_points  # need at least this many points for a valid match
+        self.min_points = min_points                            # need at least this many points for a valid match
         self.total_matches = 0
         self.successful_matches = 0
     
@@ -101,7 +100,6 @@ class ScanMatcher:
         If fix_rotation is True, we only estimate translation (dx, dy).
         This is useful when we trust the gyro for rotation (which we do!).
         
-        Math from: https://igl.ethz.ch/projects/ARAP/svd_rot.pdf
         """
         if len(source_matched) < 3: return 0.0, 0.0, 0.0
         
@@ -228,9 +226,9 @@ class LoopClosureDetector:
     If the robot is close to an old pose AND the scans look similar, it's a loop!
     """
     def __init__(self, distance_threshold=0.5, scan_similarity_threshold=0.85, min_time_gap=100):
-        self.distance_threshold = distance_threshold  # how close poses need to be (meters)
+        self.distance_threshold = distance_threshold                # how close poses need to be (meters)
         self.scan_similarity_threshold = scan_similarity_threshold  # how similar scans need to be
-        self.min_time_gap = min_time_gap  # don't match with very recent poses (they're obviously similar)
+        self.min_time_gap = min_time_gap                            # don't match with very recent poses (they're obviously similar)
     
     def compute_scan_signature(self, scan_points):
         """
@@ -315,8 +313,7 @@ class PoseGraphOptimizer:
     Simple pose graph optimizer.
     
     When a loop closure is detected, we need to correct the trajectory.
-    This uses a simple linear interpolation approach - not as fancy as 
-    g2o or GTSAM but it works ok for our purposes.
+    This uses a simple linear interpolation approach.
     
     Basically distributes the error evenly across all poses in the loop.
     """
@@ -482,13 +479,13 @@ class SimpleWallFollower:
     def __init__(self, base_speed=0.6, follow_side='left', target_dist=0.15, kp=2.0, ki=0.05, kd=0.7, find_threshold=0.70, front_threshold=0.30):
         # Basic movement parameters
         self.base_speed = base_speed
-        self.follow_side = follow_side  # which side to keep the wall on
-        self.target_dist = target_dist  # desired distance from wall (meters)
+        self.follow_side = follow_side      # which side to keep the wall on
+        self.target_dist = target_dist      # desired distance from wall (meters)
         
         # PID gains - these took forever to tune
-        self.kp = kp  # proportional: react to current error
-        self.ki = ki  # integral: eliminate steady-state error (keep small!)
-        self.kd = kd  # derivative: damp oscillations (really helps)
+        self.kp = kp                        # proportional: react to current error
+        self.ki = ki                        # integral: eliminate steady-state error
+        self.kd = kd                        # derivative: damp oscillations
         self.integral_error = 0
         self.last_error = 0
         
@@ -652,16 +649,15 @@ class SLAMWithScanMatching:
     - Occupancy grid mapping
     - Loop closure detection and correction
     
-    The key insight is that we trust the gyro for rotation (it's pretty accurate)
-    and use ICP mainly to correct translation errors. This is way more stable
-    than letting ICP estimate both rotation AND translation.
+    We trust the gyro for rotation and use ICP mainly to correct translation errors. 
+    This is way more stable than letting ICP estimate both rotation AND translation.
     """
     def __init__(self, initial_pose=(0, 0, 0), use_scan_matching=True, use_loop_closure=True):
         # Components
         self.mapper = OccupancyMap(size_meters=20, resolution=0.1)
         self.loop_detector = LoopClosureDetector(distance_threshold=2.0, scan_similarity_threshold=0.96, min_time_gap=150)
         self.optimizer = PoseGraphOptimizer()
-        self.pose_graph = []  # list of PoseNodes
+        self.pose_graph = []                    # list of PoseNodes
         self.current_pose = list(initial_pose)  # [x, y, theta]
         
         # Scan matcher configuration
@@ -691,7 +687,7 @@ class SLAMWithScanMatching:
 
     def analyze_environment(self, points):
         """
-        Detect if we're in a corridor (elongated environment).
+        Detect if we're in a corridor .
         
         In corridors, ICP tends to slide along the walls because there's no
         features to lock onto in the direction of travel. In these cases,
@@ -769,7 +765,7 @@ class SLAMWithScanMatching:
         kf_dist = np.sqrt(kf_dx**2 + kf_dy**2)
         kf_dtheta = abs((odom_theta - self.keyframe_odom_pose[2] + np.pi) % (2*np.pi) - np.pi)
         
-        # Skip if we haven't moved enough or don't have enough lidar points
+        # Exit if we haven't moved enough or don't have enough lidar points
         if (kf_dist < self.keyframe_dist_thresh and kf_dtheta < self.keyframe_angle_thresh) or len(lidar_local_points) < 10:
             return tuple(self.current_pose)
 
@@ -794,7 +790,7 @@ class SLAMWithScanMatching:
         if self.use_scan_matching:
             # Check if we're in a corridor
             is_corridor = self.analyze_environment(lidar_local_points)
-            
+
             if is_corridor:
                 # CORRIDOR LOCK: Don't trust ICP in hallways
                 # It tends to "slide" along the walls because there's nothing
@@ -919,7 +915,7 @@ def main(args=None):
     gt_x, gt_y, gt_theta = robot.get_ground_truth_pose()
     initial_gt_pose = (gt_x, gt_y, gt_theta)
     initial_pose = (0, 0, 0)
-    print(f"\nInitial ground truth pose: ({gt_x:.2f}, {gt_y:.2f}, {np.degrees(gt_theta):.1f}°)")
+    print(f"\nInitial truth position: ({gt_x:.2f}, {gt_y:.2f}, {np.degrees(gt_theta):.1f}°)")
     
     slam = SLAMWithScanMatching(
         initial_pose=initial_pose,
@@ -947,21 +943,6 @@ def main(args=None):
     ax2.axis('equal')
     
     iteration = 0
-    print("\n" + "="*70)
-    print("SLAM WITH SCAN MATCHING")
-    print("="*70)
-    print("This system will:")
-    print("  ✓ Use robot.update_odometry() for initial pose estimation")
-    if USE_SCAN_MATCHING:
-        print("  ✓ Apply ICP scan matching to correct odometry drift")
-    else:
-        print("  ✗ Scan matching disabled (odometry only)")
-    print("  ✓ Build occupancy grid map from lidar scans")
-    print("  ✓ Track robot trajectory")
-    if USE_LOOP_CLOSURE:
-        print("  ✓ Detect loop closures for global correction")
-    else:
-        print("  ✗ Loop closure disabled")
     print("\nModes:")
     print("  python assignment_2_scan_match.py                    - Full SLAM with scan matching")
     print("  python assignment_2_scan_match.py --no-scan-matching - Odometry only")
@@ -970,20 +951,20 @@ def main(args=None):
     print("="*70 + "\n")
     
     while coppelia.is_running():
-        # IMPORTANT: Call update_odometry every step
+        # Call update_odometry every step
         robot.update_odometry()
         
         # Get odometry estimate
         odom_x, odom_y, odom_theta = robot.get_estimated_pose()
         
-        # Get ground truth for comparison
+        # Get ground truth (just for comparison)
         gt_x, gt_y, gt_theta = robot.get_ground_truth_pose()
         ground_truth_trajectory.append((gt_x, gt_y))
         
         # Get lidar data
         raw_lidar = robot.read_lidar_data()
         
-        # Use ground truth or SLAM based on mode
+        # JUST FOR TESTING
         if USE_GROUND_TRUTH:
             # Directly use ground truth
             corrected_x, corrected_y, corrected_theta = gt_x, gt_y, gt_theta
@@ -991,7 +972,7 @@ def main(args=None):
             node = PoseNode(len(slam.pose_graph), gt_x, gt_y, gt_theta, copy.deepcopy(raw_lidar))
             slam.pose_graph.append(node)
         else:
-            # SLAM update with scan matching
+            # SLAM
             corrected_x, corrected_y, corrected_theta = slam.update(
                 raw_lidar, odom_x, odom_y, odom_theta
             )
@@ -1075,31 +1056,6 @@ def main(args=None):
         time.sleep(0.01)
 
     coppelia.stop_simulation()
-    
-    print("\n" + "="*70)
-    print("SLAM STATISTICS")
-    print("="*70)
-    print(f"Total iterations: {iteration}")
-    print(f"Pose graph nodes: {len(slam.pose_graph)}")
-    
-    if USE_SCAN_MATCHING:
-        print(f"\nScan Matching:")
-        print(f"  Total matches attempted: {slam.scan_matcher.total_matches}")
-        print(f"  Successful matches: {slam.scan_matcher.successful_matches}")
-        if slam.scan_matcher.total_matches > 0:
-            success_rate = 100.0 * slam.scan_matcher.successful_matches / slam.scan_matcher.total_matches
-            print(f"  Success rate: {success_rate:.1f}%")
-        print(f"  Scan match used: {slam.scan_match_used_count} times")
-        print(f"  Odometry fallback: {slam.odom_fallback_count} times")
-    
-    if USE_LOOP_CLOSURE:
-        print(f"\nLoop Closure:")
-        print(f"  Detections: {slam.loop_closures_detected}")
-        print(f"  Status: {'✓ ACTIVE' if slam.loop_closures_detected > 0 else '✗ not triggered'}")
-    
-    print(f"\n{'✓' if USE_SCAN_MATCHING else '✗'} Scan matching {'ENABLED' if USE_SCAN_MATCHING else 'DISABLED'}")
-    print(f"{'✓' if USE_LOOP_CLOSURE else '✗'} Loop closure {'ENABLED' if USE_LOOP_CLOSURE else 'DISABLED'}")
-    print("="*70)
 
 
 if __name__ == "__main__":
