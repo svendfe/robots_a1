@@ -7,601 +7,351 @@ from scipy.ndimage import gaussian_filter
 from scipy.spatial import KDTree
 import copy
 
-
 class PoseNode:
-    """A node in the pose graph representing a robot pose"""
     def __init__(self, idx, x, y, theta, scan):
         self.idx = idx
         self.x = x
         self.y = y
         self.theta = theta
-        self.scan = scan  # Store lidar scan for loop closure detection
-
+        self.scan = scan
 
 class ScanMatcher:
-    """2D ICP (Iterative Closest Point) scan matching for odometry correction"""
-    
     def __init__(self, max_iterations=20, tolerance=1e-4, 
                  max_correspondence_dist=0.3, min_points=10):
         self.max_iterations = max_iterations
         self.tolerance = tolerance
         self.max_correspondence_dist = max_correspondence_dist
         self.min_points = min_points
-        
-        # Statistics
         self.total_matches = 0
         self.successful_matches = 0
     
     def preprocess_scan(self, scan_points, max_range=4.0, min_range=0.1, downsample_factor=2):
-        """Convert raw scan to numpy array, filter and downsample"""
-        if len(scan_points) == 0:
-            return np.array([]).reshape(0, 2)
-        
-        # Convert to numpy array
+        if len(scan_points) == 0: return np.array([]).reshape(0, 2)
         data = np.array(scan_points).reshape(-1, 3)
         x, y = data[:, 0], data[:, 1]
-        
-        # Filter by range
         distances = np.sqrt(x**2 + y**2)
         valid = (distances > min_range) & (distances < max_range)
         points = np.column_stack([x[valid], y[valid]])
-        
-        # Downsample for efficiency
         if len(points) > 0 and downsample_factor > 1:
             points = points[::downsample_factor]
-        
         return points
     
     def find_correspondences(self, source_points, target_points):
-        """Find nearest neighbors using KDTree"""
         if len(source_points) == 0 or len(target_points) == 0:
             return np.array([]).reshape(0, 2), np.array([])
-        
-        # Build KDTree of target points
         tree = KDTree(target_points)
-        
-        # Query for each source point
         distances, indices = tree.query(source_points)
-        
-        # Filter by maximum correspondence distance
         valid_mask = distances < self.max_correspondence_dist
-        
-        # Create array of correspondence pairs [source_idx, target_idx]
         source_indices = np.where(valid_mask)[0]
         target_indices = indices[valid_mask]
-        
         correspondences = np.column_stack([source_indices, target_indices])
         valid_distances = distances[valid_mask]
-        
         return correspondences, valid_distances
     
-    def estimate_transform_svd(self, source_matched, target_matched):
-        """Estimate 2D rigid transform (dx, dy, dtheta) using SVD"""
-        if len(source_matched) < 3:
-            return 0.0, 0.0, 0.0
+    def estimate_transform_svd(self, source_matched, target_matched, fix_rotation=False):
+        """
+        Estimate 2D rigid transform. 
+        If fix_rotation is True, it ONLY estimates translation (dx, dy).
+        """
+        if len(source_matched) < 3: return 0.0, 0.0, 0.0
         
-        # Center the point clouds
         source_center = np.mean(source_matched, axis=0)
         target_center = np.mean(target_matched, axis=0)
         
+        if fix_rotation:
+            # If rotation is fixed (assumed matched), we just align centroids
+            t = target_center - source_center
+            return t[0], t[1], 0.0
+            
         source_centered = source_matched - source_center
         target_centered = target_matched - target_center
-        
-        # Compute covariance matrix
         H = source_centered.T @ target_centered
-        
-        # SVD decomposition
         U, _, Vt = np.linalg.svd(H)
-        
-        # Compute rotation matrix
         R = Vt.T @ U.T
-        
-        # Handle reflection case (determinant should be 1, not -1)
         if np.linalg.det(R) < 0:
             Vt[-1, :] *= -1
             R = Vt.T @ U.T
-        
-        # Extract rotation angle
         dtheta = np.arctan2(R[1, 0], R[0, 0])
-        
-        # Compute translation
         t = target_center - (R @ source_center)
-        dx, dy = t[0], t[1]
-        
-        return dx, dy, dtheta
+        return t[0], t[1], dtheta
     
     def apply_transform(self, points, dx, dy, dtheta):
-        """Apply 2D rigid transform to points"""
-        if len(points) == 0:
-            return points
-        
-        # Rotation matrix
-        c = np.cos(dtheta)
-        s = np.sin(dtheta)
+        if len(points) == 0: return points
+        c, s = np.cos(dtheta), np.sin(dtheta)
         R = np.array([[c, -s], [s, c]])
-        
-        # Apply rotation then translation
         transformed = (R @ points.T).T
         transformed[:, 0] += dx
         transformed[:, 1] += dy
-        
         return transformed
     
-    def icp(self, source_scan, target_scan, initial_guess=(0, 0, 0)):
-        """
-        Run ICP algorithm to align source scan to target scan.
-        
-        Returns: (dx, dy, dtheta, confidence)
-        """
-        # Preprocess scans
+    def icp(self, source_scan, target_scan, initial_guess=(0, 0, 0), fix_rotation=False):
         source = self.preprocess_scan(source_scan)
         target = self.preprocess_scan(target_scan)
-        
-        # Check minimum points
         if len(source) < self.min_points or len(target) < self.min_points:
-            return initial_guess + (0.0,)  # Return with zero confidence
+            return initial_guess + (0.0,)
         
-        # Apply initial guess to source
         dx, dy, dtheta = initial_guess
+        # Apply initial guess (including Gyro rotation)
         transformed_source = self.apply_transform(source, dx, dy, dtheta)
-        
-        # Track cumulative transform
         total_dx, total_dy, total_dtheta = dx, dy, dtheta
         
-        # ICP iterations
         prev_error = float('inf')
         for iteration in range(self.max_iterations):
-            # Find correspondences
-            correspondences, distances = self.find_correspondences(
-                transformed_source, target
-            )
-            
-            # Check if we have enough correspondences
+            correspondences, distances = self.find_correspondences(transformed_source, target)
             if len(correspondences) < self.min_points:
-                confidence = 0.0
-                return (total_dx, total_dy, total_dtheta, confidence)
+                return (total_dx, total_dy, total_dtheta, 0.0)
             
-            # Compute mean error
             mean_error = np.mean(distances)
-            
-            # Check convergence
-            if abs(prev_error - mean_error) < self.tolerance:
-                break
+            if abs(prev_error - mean_error) < self.tolerance: break
             prev_error = mean_error
             
-            # Get matched point pairs
             source_matched = transformed_source[correspondences[:, 0]]
             target_matched = target[correspondences[:, 1]]
             
-            # Estimate incremental transform
+            # Estimate transform (Optionally fixing rotation to 0 relative to current state)
             inc_dx, inc_dy, inc_dtheta = self.estimate_transform_svd(
-                source_matched, target_matched
+                source_matched, target_matched, fix_rotation=fix_rotation
             )
             
-            # Check if incremental transform is too small
-            if (abs(inc_dx) < self.tolerance and 
-                abs(inc_dy) < self.tolerance and 
-                abs(inc_dtheta) < self.tolerance):
-                break
+            if (abs(inc_dx) < self.tolerance and abs(inc_dy) < self.tolerance and abs(inc_dtheta) < self.tolerance): break
             
-            # Apply incremental transform
-            transformed_source = self.apply_transform(
-                transformed_source, inc_dx, inc_dy, inc_dtheta
-            )
-            
-            # Update total transform
+            transformed_source = self.apply_transform(transformed_source, inc_dx, inc_dy, inc_dtheta)
             total_dx += inc_dx
             total_dy += inc_dy
             total_dtheta += inc_dtheta
-        
-        # Compute confidence based on final alignment quality
-        # Good alignment = low mean distance and high number of correspondences
-        final_correspondences, final_distances = self.find_correspondences(
-            transformed_source, target
-        )
-        
+            
+        final_correspondences, final_distances = self.find_correspondences(transformed_source, target)
         if len(final_distances) > 0:
             mean_dist = np.mean(final_distances)
             correspondence_ratio = len(final_correspondences) / len(source)
-            
-            # Confidence metric: higher when distance is low and many points match
             confidence = correspondence_ratio * (1.0 / (1.0 + mean_dist * 10))
             confidence = np.clip(confidence, 0.0, 1.0)
-        else:
-            confidence = 0.0
-        
+        else: confidence = 0.0
         return (total_dx, total_dy, total_dtheta, confidence)
     
-    def match_scans(self, current_scan, previous_scan, odom_delta):
-        """
-        Match two consecutive scans using ICP with odometry as initial guess.
-        
-        Args:
-            current_scan: Current lidar scan (raw points)
-            previous_scan: Previous lidar scan (raw points)
-            odom_delta: Odometry-based motion estimate (dx, dy, dtheta)
-        
-        Returns: (dx, dy, dtheta, confidence)
-        """
+    def match_scans(self, current_scan, previous_scan, odom_delta, fix_rotation=False):
         self.total_matches += 1
-        
-        # Run ICP with odometry as initial guess
         dx, dy, dtheta, confidence = self.icp(
-            current_scan, previous_scan, initial_guess=odom_delta
+            current_scan, previous_scan, 
+            initial_guess=odom_delta, 
+            fix_rotation=fix_rotation
         )
-        
-        if confidence > 0.5:
-            self.successful_matches += 1
-        
+        if confidence > 0.5: self.successful_matches += 1
         return dx, dy, dtheta, confidence
 
-
 class LoopClosureDetector:
-    """Detects when robot returns to previously visited location"""
-    
     def __init__(self, distance_threshold=0.5, scan_similarity_threshold=0.85, min_time_gap=100):
         self.distance_threshold = distance_threshold
         self.scan_similarity_threshold = scan_similarity_threshold
         self.min_time_gap = min_time_gap
-        
+    
     def compute_scan_signature(self, scan_points):
-        """Create a rotation-invariant descriptor from lidar scan"""
-        if len(scan_points) == 0:
-            return None
-        
+        if len(scan_points) == 0: return None
         data = np.array(scan_points).reshape(-1, 3)
-        x = data[:, 0]
-        y = data[:, 1]
-        
+        x, y = data[:, 0], data[:, 1]
         angles = np.arctan2(y, x)
         distances = np.sqrt(x**2 + y**2)
-        
         valid_mask = distances > 0.2
         angles = angles[valid_mask]
         distances = distances[valid_mask]
-        
-        if len(distances) == 0:
-            return None
-        
-        bins = 72
-        hist, _ = np.histogram(angles, bins=bins, range=(-np.pi, np.pi), weights=1.0/distances)
-        
-        if np.sum(hist) > 0:
-            hist = hist / np.sum(hist)
-        
+        if len(distances) == 0: return None
+        hist, _ = np.histogram(angles, bins=72, range=(-np.pi, np.pi), weights=1.0/distances)
+        if np.sum(hist) > 0: hist = hist / np.sum(hist)
         return hist
     
     def compare_scans(self, sig1, sig2):
-        """Compare two scan signatures using correlation (rotation invariant)"""
-        if sig1 is None or sig2 is None:
-            return 0.0
-        
+        if sig1 is None or sig2 is None: return 0.0
         max_similarity = 0.0
         norm1 = np.linalg.norm(sig1)
         norm2 = np.linalg.norm(sig2)
-        
-        if norm1 == 0 or norm2 == 0:
-            return 0.0
-            
+        if norm1 == 0 or norm2 == 0: return 0.0
         for shift in range(len(sig1)):
             rolled_sig2 = np.roll(sig2, shift)
-            correlation = np.dot(sig1, rolled_sig2)
-            similarity = correlation / (norm1 * norm2)
-            if similarity > max_similarity:
-                max_similarity = similarity
-        
+            similarity = np.dot(sig1, rolled_sig2) / (norm1 * norm2)
+            if similarity > max_similarity: max_similarity = similarity
         return max_similarity
     
     def detect_loop_closure(self, current_node, pose_graph):
-        """Check if current pose is close to any previous pose"""
-        if len(pose_graph) < self.min_time_gap:
-            return False, None, 0.0
-        
+        if len(pose_graph) < self.min_time_gap: return False, None, 0.0
         current_sig = self.compute_scan_signature(current_node.scan)
-        if current_sig is None:
-            return False, None, 0.0
-        
+        if current_sig is None: return False, None, 0.0
         old_poses = pose_graph[:-self.min_time_gap]
-        
-        if len(old_poses) == 0:
-            return False, None, 0.0
-        
+        if len(old_poses) == 0: return False, None, 0.0
         positions = np.array([[n.x, n.y] for n in old_poses])
         tree = KDTree(positions)
-        
         current_pos = np.array([current_node.x, current_node.y])
         indices = tree.query_ball_point(current_pos, self.distance_threshold)
-        
-        if len(indices) == 0:
-            return False, None, 0.0
-        
         best_similarity = 0.0
         best_match_idx = None
-        
         for idx in indices:
             candidate_node = old_poses[idx]
-            candidate_sig = self.compute_scan_signature(candidate_node.scan)
-            
-            similarity = self.compare_scans(current_sig, candidate_sig)
-            
+            similarity = self.compare_scans(current_sig, self.compute_scan_signature(candidate_node.scan))
             if similarity > best_similarity:
                 best_similarity = similarity
                 best_match_idx = candidate_node.idx
-        
         if best_similarity > self.scan_similarity_threshold:
             return True, best_match_idx, best_similarity
-        
         return False, None, 0.0
 
-
 class PoseGraphOptimizer:
-    """Simple pose graph optimization for loop closure"""
-    
     def __init__(self):
         self.optimization_strength = 0.15
-    
     def optimize_trajectory(self, pose_graph, loop_closure_from, loop_closure_to):
-        """Distribute error correction across trajectory between loop closure points"""
-        if loop_closure_from >= loop_closure_to:
-            return pose_graph
-        
+        if loop_closure_from >= loop_closure_to: return pose_graph
         node_from = pose_graph[loop_closure_from]
         node_to = pose_graph[loop_closure_to]
-        
         error_x = node_to.x - node_from.x
         error_y = node_to.y - node_from.y
         error_theta = node_to.theta - node_from.theta
-        
-        while error_theta > np.pi:
-            error_theta -= 2 * np.pi
-        while error_theta < -np.pi:
-            error_theta += 2 * np.pi
-        
+        while error_theta > np.pi: error_theta -= 2 * np.pi
+        while error_theta < -np.pi: error_theta += 2 * np.pi
         num_nodes = loop_closure_to - loop_closure_from
-        
         for i in range(loop_closure_from, loop_closure_to + 1):
             alpha = (i - loop_closure_from) / num_nodes if num_nodes > 0 else 0
             alpha *= self.optimization_strength
-            
             pose_graph[i].x -= alpha * error_x
             pose_graph[i].y -= alpha * error_y
             pose_graph[i].theta -= alpha * error_theta
-        
         return pose_graph
 
-
 class OccupancyMap:
-    """Occupancy grid map"""
-    
     def __init__(self, size_meters=20, resolution=0.1):
         self.resolution = resolution
         self.size_meters = size_meters
         self.grid_size = int(size_meters / resolution)
         self.center = self.grid_size // 2
-        
         self.log_odds = np.zeros((self.grid_size, self.grid_size))
-        
-        self.prob_occ = 0.9
-        self.prob_free = 0.3
-        
-        self.log_occ = np.log(self.prob_occ / (1 - self.prob_occ))
-        self.log_free = np.log(self.prob_free / (1 - self.prob_free))
-        
+        self.log_occ = np.log(0.9 / 0.1)
+        self.log_free = np.log(0.3 / 0.7)
         self.log_max = 10.0
         self.log_min = -10.0
-        
         self.max_lidar_range = 5.0
-
+    
     def world_to_grid(self, x_world, y_world):
         x_world = np.array(x_world)
         y_world = np.array(y_world)
-        
         grid_x = ((x_world / self.resolution) + self.center).astype(int)
         grid_y = ((y_world / self.resolution) + self.center).astype(int)
-        
-        grid_x = np.clip(grid_x, 0, self.grid_size - 1)
-        grid_y = np.clip(grid_y, 0, self.grid_size - 1)
-        
-        return grid_x, grid_y
+        return np.clip(grid_x, 0, self.grid_size - 1), np.clip(grid_y, 0, self.grid_size - 1)
     
     def get_probability_grid(self, threshold=True, smooth=True):
-        """Convert log-odds to probability for visualization"""
         log_odds_display = self.log_odds.copy()
-        if smooth:
-            log_odds_display = gaussian_filter(log_odds_display, sigma=1.0)
-        
+        if smooth: log_odds_display = gaussian_filter(log_odds_display, sigma=1.0)
         prob = 1.0 - (1.0 / (1.0 + np.exp(log_odds_display)))
-        
         if threshold:
             clean_map = np.full_like(prob, 0.5)
             clean_map[prob > 0.8] = 1.0
             clean_map[prob < 0.2] = 0.0
             return clean_map
-        else:
-            return prob
-
+        return prob
+    
     def update_map(self, lidar_local_points, robot_x, robot_y, robot_theta):
-        """Update map with given pose"""
-        if len(lidar_local_points) == 0:
-            return
-
+        if len(lidar_local_points) == 0: return
         data = np.array(lidar_local_points).reshape(-1, 3)
-        local_x = data[:, 0]
-        local_y = data[:, 1]
-        
+        local_x, local_y = data[:, 0], data[:, 1]
         distances = np.sqrt(local_x**2 + local_y**2)
-        valid_mask = distances < self.max_lidar_range
-        
-        local_x = local_x[valid_mask]
-        local_y = local_y[valid_mask]
-        
-        if len(local_x) == 0:
-            return
-        
+        valid = distances < self.max_lidar_range
+        local_x, local_y = local_x[valid], local_y[valid]
+        if len(local_x) == 0: return
         global_x = (local_x * np.cos(robot_theta) - local_y * np.sin(robot_theta)) + robot_x
         global_y = (local_x * np.sin(robot_theta) + local_y * np.cos(robot_theta)) + robot_y
-        
         gx, gy = self.world_to_grid(global_x, global_y)
         rx, ry = self.world_to_grid(robot_x, robot_y)
-        
         for x, y in zip(gx, gy):
             rr, cc = line(int(rx), int(ry), x, y)
-            if len(cc) > 1:
-                self.log_odds[cc[:-1], rr[:-1]] += self.log_free
-            if len(cc) > 0:
-                self.log_odds[cc[-1], rr[-1]] += self.log_occ
-        
+            if len(cc) > 1: self.log_odds[cc[:-1], rr[:-1]] += self.log_free
+            if len(cc) > 0: self.log_odds[cc[-1], rr[-1]] += self.log_occ
         self.log_odds = np.clip(self.log_odds, self.log_min, self.log_max)
     
     def rebuild_from_trajectory(self, pose_graph):
-        """Rebuild entire map from optimized pose graph"""
         self.log_odds = np.zeros((self.grid_size, self.grid_size))
-        
         for node in pose_graph:
             self.update_map(node.scan, node.x, node.y, node.theta)
 
-
 class SimpleWallFollower:
-    """Wall following controller"""
-    
-    def __init__(self,
-                 base_speed=0.6,
-                 follow_side='left',
-                 target_dist=0.15,
-                 kp=2.0,
-                 ki=0.05,
-                 kd=0.7,
-                 find_threshold=0.70,
-                 front_threshold=0.30):
-        
+    def __init__(self, base_speed=0.6, follow_side='left', target_dist=0.15, kp=2.0, ki=0.05, kd=0.7, find_threshold=0.70, front_threshold=0.30):
         self.base_speed = base_speed
         self.follow_side = follow_side
         self.target_dist = target_dist
-        
         self.kp = kp
         self.ki = ki
         self.kd = kd
         self.integral_error = 0
         self.last_error = 0
-        
         self.find_threshold = find_threshold
         self.front_threshold = front_threshold
-        
         self.mode = 'FIND'
         self.corner_step = 0
         self.corner_phase = None
-        
         self.wall_lost_counter = 0
         self.turning_to_follow = False
         self.wall_lost_steps = 40
-        
         self.back_duration = 20
         self.turn_duration = 50
         self.forward_duration = 6
-        
     def get_sensor(self, dist, idx):
         v = dist[idx]
-        if v is None or v > 1.0:
-            return None
+        if v is None or v > 1.0: return None
         return v
-    
     def get_side_distance(self, dist):
-        if self.follow_side == 'left':
-            front_idx, back_idx = 0, 15
-        else:
-            front_idx, back_idx = 7, 8
-        
+        if self.follow_side == 'left': front_idx, back_idx = 0, 15
+        else: front_idx, back_idx = 7, 8
         front = self.get_sensor(dist, front_idx)
         back = self.get_sensor(dist, back_idx)
-        
         readings = [r for r in [front, back] if r is not None]
-        if not readings:
-            return None, None, None
-        
+        if not readings: return None, None, None
         return sum(readings)/len(readings), front, back
-    
     def get_front_distance(self, dist):
         front_readings = []
         for idx in [3, 4]:
             reading = self.get_sensor(dist, idx)
-            if reading is not None:
-                front_readings.append(reading)
+            if reading is not None: front_readings.append(reading)
         return min(front_readings) if front_readings else 1.0
-    
     def start_corner_escape(self):
         self.mode = 'CORNER'
         self.corner_phase = 'back'
         self.corner_step = 0
         self.integral_error = 0
-    
     def handle_corner(self):
         self.corner_step += 1
-        
         if self.corner_phase == 'back':
-            if self.follow_side == 'left':
-                left, right = -0.50, -0.75
-            else:
-                left, right = -0.75, -0.50
-            
+            if self.follow_side == 'left': left, right = -0.50, -0.75
+            else: left, right = -0.75, -0.50
             if self.corner_step >= self.back_duration:
                 self.corner_phase = 'turn'
                 self.corner_step = 0
-            
             return left, right
-        
         elif self.corner_phase == 'turn':
-            if self.follow_side == 'left':
-                left, right = 0.80, -0.80
-            else:
-                left, right = -0.80, 0.80
-            
+            if self.follow_side == 'left': left, right = 0.80, -0.80
+            else: left, right = -0.80, 0.80
             if self.corner_step >= self.turn_duration:
                 self.corner_phase = 'forward'
                 self.corner_step = 0
-            
             return left, right
-        
         elif self.corner_phase == 'forward':
             left = right = self.base_speed
-            
             if self.corner_step >= self.forward_duration:
                 self.mode = 'FIND'
                 self.corner_phase = None
-            
             return left, right
-    
     def step(self, dist):
         side_avg, side_front, side_back = self.get_side_distance(dist)
         front_dist = self.get_front_distance(dist)
-        
         if front_dist < self.front_threshold:
-            if self.mode != 'CORNER':
-                self.start_corner_escape()
-        
-        if self.mode == 'CORNER':
-            return self.handle_corner()
-        
+            if self.mode != 'CORNER': self.start_corner_escape()
+        if self.mode == 'CORNER': return self.handle_corner()
         if self.mode == 'FIND':
             if side_avg is not None and side_avg < self.find_threshold:
                 self.mode = 'FOLLOW'
                 self.integral_error = 0
                 self.last_error = 0
-            else:
-                return self.base_speed, self.base_speed
-        
+            else: return self.base_speed, self.base_speed
         if side_avg is None or side_avg > 0.80:
             self.wall_lost_counter += 1
-            
             if self.wall_lost_counter < self.wall_lost_steps:
                 self.turning_to_follow = True
-                
-                if self.follow_side == 'left':
-                    left_speed = 0.10
-                    right_speed = 0.50
-                else:
-                    left_speed = 0.50
-                    right_speed = 0.10
-                
+                if self.follow_side == 'left': left_speed, right_speed = 0.10, 0.50
+                else: left_speed, right_speed = 0.50, 0.10
                 return left_speed, right_speed
             else:
                 self.mode = 'FIND'
@@ -612,108 +362,60 @@ class SimpleWallFollower:
         else:
             self.wall_lost_counter = 0
             self.turning_to_follow = False
-        
         distance_error = side_avg - self.target_dist
-        
-        if side_front is not None and side_back is not None:
-            angle_error = (side_front - side_back) / 0.18
-        else:
-            angle_error = 0
-        
+        if side_front is not None and side_back is not None: angle_error = (side_front - side_back) / 0.18
+        else: angle_error = 0
         self.integral_error += distance_error
         self.integral_error = max(-0.5, min(0.5, self.integral_error))
-        
         derivative_error = distance_error - self.last_error
         self.last_error = distance_error
-        
-        steering = (self.kp * distance_error + 
-                   self.ki * self.integral_error + 
-                   self.kd * angle_error)
-        
+        steering = (self.kp * distance_error + self.ki * self.integral_error + self.kd * angle_error)
         steering = max(-0.8, min(0.8, steering))
         forward = self.base_speed
-        
         if self.follow_side == 'left':
-            left_speed = forward - steering
-            right_speed = forward + steering
+            left_speed, right_speed = forward - steering, forward + steering
         else:
-            left_speed = forward + steering
-            right_speed = forward - steering
-        
-        left_speed = max(0.1, min(1.2, left_speed))
-        right_speed = max(0.1, min(1.2, right_speed))
-        
-        return left_speed, right_speed
-
+            left_speed, right_speed = forward + steering, forward - steering
+        return max(0.1, min(1.2, left_speed)), max(0.1, min(1.2, right_speed))
 
 class SLAMWithScanMatching:
-    """SLAM using scan matching to correct odometry drift"""
-    
     def __init__(self, initial_pose=(0, 0, 0), use_scan_matching=True, use_loop_closure=True):
         self.mapper = OccupancyMap(size_meters=20, resolution=0.1)
-        self.loop_detector = LoopClosureDetector(
-            distance_threshold=2.0,
-            scan_similarity_threshold=0.96,
-            min_time_gap=150
-        )
+        self.loop_detector = LoopClosureDetector(distance_threshold=2.0, scan_similarity_threshold=0.96, min_time_gap=150)
         self.optimizer = PoseGraphOptimizer()
-        
-        # Pose graph
         self.pose_graph = []
         self.current_pose = list(initial_pose)
-        
-        # Scan matching
-        self.scan_matcher = ScanMatcher(
-            max_iterations=20,
-            tolerance=1e-4,
-            max_correspondence_dist=0.3,
-            min_points=10
-        )
+        self.scan_matcher = ScanMatcher(max_iterations=20, tolerance=1e-4, max_correspondence_dist=0.3, min_points=10)
         self.last_scan = None
         self.last_odom_pose = None
-        
-        # --- NEW: Keyframe & Gating Parameters ---
-        # Track the odometry pose when we took the last keyframe
         self.keyframe_odom_pose = list(initial_pose)
-        
-        # Keyframe Thresholds: Only run ICP if we moved this much
-        self.keyframe_dist_thresh = 0.15  # 15 cm
-        self.keyframe_angle_thresh = 0.1  # ~5.7 degrees
-        
-        # Validation Gate: Reject ICP if it disagrees with Odometry by this much
-        # This prevents the "Spikes" seen in your logs (e.g. Iter 300)
-        self.gate_dist_thresh = 0.15      # Max 15cm discrepancy allowed
-        self.gate_angle_thresh = 0.1      # Max ~5.7 degrees discrepancy
-        # -----------------------------------------
-        
-        # Options
+        self.keyframe_dist_thresh = 0.15
+        self.keyframe_angle_thresh = 0.1
+        self.gate_dist_thresh = 0.25      
+        self.gate_angle_thresh = 0.15     
+        self.confidence_threshold = 0.60
         self.use_scan_matching = use_scan_matching
         self.use_loop_closure = use_loop_closure
-        self.confidence_threshold = 0.5 
-        
-        # Statistics
-        self.loop_closures_detected = 0
-        self.last_optimization_time = 0
         self.scan_match_used_count = 0
         self.odom_fallback_count = 0
-    # Add this helper method to the SLAM class
-    def check_front_wall(self, lidar_points):
-        """Returns True if there is a wall directly in front (< 2m)"""
-        if len(lidar_points) == 0: return False
-        data = np.array(lidar_points).reshape(-1, 3)
-        # Filter for points in front cone (+/- 15 degrees)
-        angle = np.arctan2(data[:, 1], data[:, 0])
-        dist = np.sqrt(data[:, 0]**2 + data[:, 1]**2)
-        front_points = (np.abs(angle) < np.radians(15)) & (dist < 2.0)
-        return np.sum(front_points) > 10
+        self.loop_closures_detected = 0
+
+    def analyze_environment(self, points):
+        """Returns True if environment is a Corridor (high aspect ratio)"""
+        if len(points) < 10: return False
+        data = np.array(points).reshape(-1, 3) 
+        xy = data[:, 0:2]
+        if xy.shape[0] < 5: return False
+        cov = np.cov(xy.T)
+        evals, evecs = np.linalg.eig(cov)
+        idx = evals.argsort()[::-1]
+        evals = evals[idx]
+        # Ratio of Major Axis / Minor Axis
+        if evals[1] > 0 and evals[0] / evals[1] > 10.0: # Threshold 10.0
+            return True
+        return False
 
     def update(self, lidar_local_points, odom_x, odom_y, odom_theta):
-        """
-        Robust Update with Keyframes, Gating, and Odometry Fallback.
-        Ensures map updates even if ICP fails.
-        """
-        
-        # 1. Initialization
         if self.last_odom_pose is None:
             self.last_odom_pose = (odom_x, odom_y, odom_theta)
             self.keyframe_odom_pose = (odom_x, odom_y, odom_theta)
@@ -722,45 +424,37 @@ class SLAMWithScanMatching:
             self.pose_graph.append(node)
             return tuple(self.current_pose)
 
-        # 2. Dead Reckoning (Odometry Prediction)
-        # Always update current_pose based on wheel encoders (high frequency)
+        # 2. Prediction Step (Dead Reckoning using Gyro)
         step_global_dx = odom_x - self.last_odom_pose[0]
         step_global_dy = odom_y - self.last_odom_pose[1]
         step_dtheta = odom_theta - self.last_odom_pose[2]
         step_dtheta = (step_dtheta + np.pi) % (2 * np.pi) - np.pi
         
-        # Convert global step to local frame
         prev_theta = self.last_odom_pose[2]
         c, s = np.cos(prev_theta), np.sin(prev_theta)
-        local_step_dx = step_global_dx * c + step_global_dy * s
-        local_step_dy = -step_global_dx * s + step_global_dy * c
+        local_dx = step_global_dx * c + step_global_dy * s
+        local_dy = -step_global_dx * s + step_global_dy * c
         
-        # Apply to current SLAM pose
         curr_theta = self.current_pose[2]
         c_curr, s_curr = np.cos(curr_theta), np.sin(curr_theta)
         
-        self.current_pose[0] += local_step_dx * c_curr - local_step_dy * s_curr
-        self.current_pose[1] += local_step_dx * s_curr + local_step_dy * c_curr
+        self.current_pose[0] += local_dx * c_curr - local_dy * s_curr
+        self.current_pose[1] += local_dx * s_curr + local_dy * c_curr
         self.current_pose[2] += step_dtheta
         self.current_pose[2] = (self.current_pose[2] + np.pi) % (2 * np.pi) - np.pi
         
         self.last_odom_pose = (odom_x, odom_y, odom_theta)
 
         # 3. Keyframe Decision
-        # Check distance from LAST KEYFRAME (not last step)
         kf_dx = odom_x - self.keyframe_odom_pose[0]
         kf_dy = odom_y - self.keyframe_odom_pose[1]
         kf_dist = np.sqrt(kf_dx**2 + kf_dy**2)
         kf_dtheta = abs((odom_theta - self.keyframe_odom_pose[2] + np.pi) % (2*np.pi) - np.pi)
         
-        should_update_graph = (kf_dist > self.keyframe_dist_thresh or kf_dtheta > self.keyframe_angle_thresh)
-        
-        # If we haven't moved enough, just return the Odometry Prediction
-        if not should_update_graph or len(lidar_local_points) < 10:
+        if (kf_dist < self.keyframe_dist_thresh and kf_dtheta < self.keyframe_angle_thresh) or len(lidar_local_points) < 10:
             return tuple(self.current_pose)
 
         # 4. Prepare ICP Guess
-        # Calculate the total movement since the last keyframe in the KEYFRAME'S coordinate system
         kf_theta_raw = self.keyframe_odom_pose[2]
         c_kf, s_kf = np.cos(kf_theta_raw), np.sin(kf_theta_raw)
         
@@ -774,104 +468,75 @@ class SLAMWithScanMatching:
         guess_dtheta = global_kf_dtheta
 
         # 5. Run Scan Matching
-        # We try to refine the "guess" using ICP
-        icp_success = False
-        scan_dx, scan_dy, scan_dtheta = guess_dx, guess_dy, guess_dtheta # Default to Odom
-
+        scan_dx, scan_dy, scan_dtheta = guess_dx, guess_dy, guess_dtheta 
+        
         if self.use_scan_matching:
-            scan_dx, scan_dy, scan_dtheta, confidence = self.scan_matcher.match_scans(
-                lidar_local_points, 
-                self.last_scan,
-                odom_delta=(guess_dx, guess_dy, guess_dtheta)
-            )
+            is_corridor = self.analyze_environment(lidar_local_points)
             
-            # Validation Gate
-            error_x = abs(scan_dx - guess_dx)
-            error_y = abs(scan_dy - guess_dy)
-            error_th = abs((scan_dtheta - guess_dtheta + np.pi) % (2*np.pi) - np.pi)
-            
-            gate_passed = (error_x < self.gate_dist_thresh) and \
-                          (error_y < self.gate_dist_thresh) and \
-                          (error_th < self.gate_angle_thresh)
-            
-            if confidence > self.confidence_threshold and gate_passed:
-                icp_success = True
-                self.scan_match_used_count += 1
-            else:
-                # ICP Failed or Rejected -> Revert to Odometry Guess
+            if is_corridor:
+                # STRICT CORRIDOR LOCK: Trust Odometry completely
+                # Prevents "infinite hallway" sliding and rotation errors
                 scan_dx, scan_dy, scan_dtheta = guess_dx, guess_dy, guess_dtheta
                 self.odom_fallback_count += 1
+            else:
+                # GYRO-ASSISTED ICP:
+                # We fix the rotation to the Gyro estimate (fix_rotation=True)
+                # ICP only corrects Translation (X, Y)
+                res_dx, res_dy, res_dtheta, confidence = self.scan_matcher.match_scans(
+                    lidar_local_points, 
+                    self.last_scan,
+                    odom_delta=(guess_dx, guess_dy, guess_dtheta),
+                    fix_rotation=True # <--- CRITICAL FIX: Trust Gyro for Theta
+                )
+                
+                # Validation Gate
+                error_x = abs(res_dx - guess_dx)
+                error_y = abs(res_dy - guess_dy)
+                
+                gate_passed = (error_x < self.gate_dist_thresh) and \
+                              (error_y < self.gate_dist_thresh)
+                
+                if confidence > self.confidence_threshold and gate_passed:
+                    scan_dx, scan_dy, scan_dtheta = res_dx, res_dy, res_dtheta
+                    self.scan_match_used_count += 1
+                else:
+                    self.odom_fallback_count += 1
         
-        # 6. Update Pose Graph & Map (Perform this regardless of ICP success)
-        # We use 'scan_dx/dy/theta' which is either the Refined ICP or the Original Odometry
-        
+        # 6. Update Pose Graph
         last_node = self.pose_graph[-1]
         c_node, s_node = np.cos(last_node.theta), np.sin(last_node.theta)
         
-        # Calculate new Global Pose based on the Last Node + The Delta
         new_x = last_node.x + (scan_dx * c_node - scan_dy * s_node)
         new_y = last_node.y + (scan_dx * s_node + scan_dy * c_node)
         new_theta = last_node.theta + scan_dtheta
         new_theta = (new_theta + np.pi) % (2 * np.pi) - np.pi
         
-        # Snap current pose to this new stable node
         self.current_pose = [new_x, new_y, new_theta]
-        
-        # Update State (Reset Keyframe accumulators)
         self.last_scan = copy.deepcopy(lidar_local_points)
         self.keyframe_odom_pose = (odom_x, odom_y, odom_theta)
         
-        # Add Node
         node = PoseNode(len(self.pose_graph), new_x, new_y, new_theta, copy.deepcopy(lidar_local_points))
         self.pose_graph.append(node)
-        
-        # Update Map
         self.mapper.update_map(lidar_local_points, new_x, new_y, new_theta)
         
-        # Loop Closure (Optional)
         if self.use_loop_closure and len(self.pose_graph) % 10 == 0 and len(self.pose_graph) > 50:
              loop_detected, match_idx, _ = self.loop_detector.detect_loop_closure(node, self.pose_graph)
              if loop_detected:
                  self.pose_graph = self.optimizer.optimize_trajectory(self.pose_graph, match_idx, node.idx)
                  self.mapper.rebuild_from_trajectory(self.pose_graph)
-                 self.last_optimization_time = len(self.pose_graph)
                  latest = self.pose_graph[-1]
                  self.current_pose = [latest.x, latest.y, latest.theta]
+                 self.loop_closures_detected += 1
 
         return tuple(self.current_pose)
     
     def get_trajectory(self):
-        """Get full trajectory for visualization"""
-        if len(self.pose_graph) == 0:
-            return [], []
-        
+        if len(self.pose_graph) == 0: return [], []
         xs = [node.x for node in self.pose_graph]
         ys = [node.y for node in self.pose_graph]
         return xs, ys
-
-    def check_front_obstacle(self, lidar_points, angle_range=np.radians(20), dist_threshold=2.0):
-        """
-        Check if there are features in front of the robot that allow reliable X-correction.
-        Returns: True if valid features exist in front (not just a corridor).
-        """
-        if len(lidar_points) == 0: return False
-        
-        # Extract X, Y
-        data = np.array(lidar_points).reshape(-1, 3)
-        x = data[:, 0]
-        y = data[:, 1]
-        
-        # Calculate angles and distances
-        angles = np.arctan2(y, x)
-        dists = np.sqrt(x**2 + y**2)
-        
-        # Look for points in the front cone (+/- 20 degrees)
-        # and within reliable range (< 2.0 meters)
-        front_mask = (np.abs(angles) < angle_range) & (dists < dist_threshold) & (dists > 0.1)
-        
-        # If we have enough points in front, we can trust ICP for forward motion
-        return np.sum(front_mask) > 15
-
+    
+    
 def main(args=None):
     import sys
     
